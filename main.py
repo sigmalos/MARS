@@ -1,47 +1,60 @@
-from master import MASTERModel
+"""Train / evaluate (relation-enhanced) MASTER.
+
+Example:
+  python main.py --universe csi300 --seeds 0 --relations ind,corr,fine --tag multi --result_dir results
+Every training run lasts --n_epoch epochs and records two model-selection protocols from the same trajectory:
+  stop : official criterion (first epoch with train MSE <= 0.95)      best : best validation IC
+"""
 import argparse
 import json
 import os
 import pickle
-import numpy as np
 import time
 
-# Please install qlib first before load the data.
+import numpy as np
+
+from master import MASTERModel
+import relations as rel
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--universe', default='csi300', choices=['csi300', 'csi800'])
-parser.add_argument('--prefix', default='opensource', choices=['original', 'opensource'],
-                    help='which training data to use (valid/test always come from opensource)')
-parser.add_argument('--data_dir', default='/data/dataset/MASTER', help='directory containing original/ and opensource/')
-parser.add_argument('--mode', default='eval', choices=['train', 'eval'],
-                    help='train: train from scratch; eval: load checkpoints from --model_dir and test')
-parser.add_argument('--seeds', default='0', help='comma separated, e.g. 0,1,2,3,4')
+parser.add_argument('--prefix', default='opensource', choices=['original', 'opensource'], help='training data source')
+parser.add_argument('--data_dir', default='/data/dataset/MASTER')
+parser.add_argument('--relation_dir', default='/data/dataset/MASTER_relations')
+parser.add_argument('--mode', default='train', choices=['train', 'eval'])
+parser.add_argument('--seeds', default='0', help='comma separated, e.g. 0,1,2')
 parser.add_argument('--gpu', type=int, default=0)
 parser.add_argument('--n_epoch', type=int, default=40)
-parser.add_argument('--model_dir', default='model')
-parser.add_argument('--save_dir', default='model', help='where trained checkpoints are written')
-parser.add_argument('--result_file', default=None, help='optional json file to dump per-seed metrics')
-parser.add_argument('--stop_loss', type=float, default=0.95, help='training-loss stop threshold (0 = run all n_epoch)')
-parser.add_argument('--test_each_epoch', action='store_true', help='record test metrics after every epoch (analysis only)')
-parser.add_argument('--model_kwargs', default='{}', help='extra JSON kwargs forwarded to MASTERModel (variant switches)')
+parser.add_argument('--stop_loss', type=float, default=0.95)
+parser.add_argument('--official_stop', action='store_true', help='end training at the official criterion')
+parser.add_argument('--select_metric', default='IC')
+parser.add_argument('--relations', default='', help='comma separated subset of ' + ','.join(rel_name for rel_name in
+                    ['ind', 'corr', 'fine', 'sw1', 'sw3', 'snap', 'rand']))
+parser.add_argument('--model_kwargs', default='{}', help='extra JSON kwargs for MASTERModel (e.g. joint_unc)')
+parser.add_argument('--tag', default='base')
+parser.add_argument('--ckpt', default=None, help='eval mode: checkpoint path pattern with {seed}')
+parser.add_argument('--result_dir', default='results')
+parser.add_argument('--ckpt_dir', default='checkpoints')
 args = parser.parse_args()
 
-universe = args.universe
-prefix = args.prefix
+universe, prefix = args.universe, args.prefix
 seeds = [int(s) for s in args.seeds.split(',')]
+relations = [r for r in args.relations.split(',') if r]
+model_kwargs = json.loads(args.model_kwargs)
 
-if args.mode == 'train':
-    with open(os.path.join(args.data_dir, prefix, f'{universe}_dl_train.pkl'), 'rb') as f:
-        dl_train = pickle.load(f)
 
-predict_data_dir = os.path.join(args.data_dir, 'opensource')
-with open(os.path.join(predict_data_dir, f'{universe}_dl_valid.pkl'), 'rb') as f:
-    dl_valid = pickle.load(f)
-with open(os.path.join(predict_data_dir, f'{universe}_dl_test.pkl'), 'rb') as f:
-    dl_test = pickle.load(f)
+def load(split, source):
+    with open(os.path.join(args.data_dir, source, f'{universe}_dl_{split}.pkl'), 'rb') as f:
+        ds = pickle.load(f)
+    if relations and source == 'opensource':
+        rel.attach(ds, args.relation_dir, universe, split)
+    return ds
 
+
+dl_train = load('train', prefix) if args.mode == 'train' else None
+dl_valid = load('valid', 'opensource')
+dl_test = load('test', 'opensource')
 print("Data Loaded.", flush=True)
-
 
 d_feat = 158
 d_model = 256
@@ -50,66 +63,45 @@ s_nhead = 2
 dropout = 0.5
 gate_input_start_index = 158
 gate_input_end_index = 221
-
-if universe == 'csi300':
-    beta = 5
-elif universe == 'csi800':
-    beta = 2
-
-n_epoch = args.n_epoch
+beta = 5 if universe == 'csi300' else 2
 lr = 1e-5
-GPU = args.gpu
-train_stop_loss_thred = args.stop_loss
-# Original training data already went through DropExtreme + CSZScoreNorm on labels when dumped.
-drop_extreme_label = (prefix == 'opensource')
 
-
-ic = []
-icir = []
-ric = []
-ricir = []
-records = []
-
+os.makedirs(args.result_dir, exist_ok=True)
 for seed in seeds:
     model = MASTERModel(
-        d_feat = d_feat, d_model = d_model, t_nhead = t_nhead, s_nhead = s_nhead, T_dropout_rate=dropout, S_dropout_rate=dropout,
+        d_feat=d_feat, d_model=d_model, t_nhead=t_nhead, s_nhead=s_nhead, T_dropout_rate=dropout, S_dropout_rate=dropout,
         beta=beta, gate_input_end_index=gate_input_end_index, gate_input_start_index=gate_input_start_index,
-        n_epochs=n_epoch, lr = lr, GPU = GPU, seed = seed, train_stop_loss_thred = train_stop_loss_thred,
-        save_path=args.save_dir, save_prefix=f'{universe}_{prefix}', drop_extreme_label=drop_extreme_label,
-        **json.loads(args.model_kwargs)
-    )
-
+        n_epochs=args.n_epoch, lr=lr, GPU=args.gpu, seed=seed, train_stop_loss_thred=args.stop_loss,
+        save_path=os.path.join(args.ckpt_dir, args.tag), save_prefix=universe, drop_extreme_label=(prefix == 'opensource'),
+        select_metric=args.select_metric, relations=relations, **model_kwargs)
+    n_params = sum(p.numel() for p in model.model.parameters())
     start = time.time()
+    record = {'tag': args.tag, 'universe': universe, 'prefix': prefix, 'seed': seed, 'relations': relations,
+              'model_kwargs': model_kwargs, 'n_params': n_params}
+    keep = ('pred', 'scale', 'nu', 'rel_alpha')
     if args.mode == 'train':
-        model.fit(dl_train, dl_valid, dl_test if args.test_each_epoch else None)
-        print("Model Trained.", flush=True)
+        selected = model.fit(dl_train, dl_valid, dl_test, full_epochs=not args.official_stop, keep_outputs=keep)
+        record['history'] = model.history
+        for name, sel in selected.items():
+            record[name] = {'epoch': sel['epoch'], 'test': sel['test'], 'valid': sel['valid']}
+            np.savez_compressed(os.path.join(args.result_dir, f'{args.tag}_{universe}_{seed}_{name}_pred.npz'),
+                                **{k: v.astype(np.float32) for k, v in sel['outputs'].items()})
     else:
-        param_path = os.path.join(args.model_dir, f'{universe}_{prefix}_{seed}.pkl')
-        print(f'Model Loaded from {param_path}')
-        model.load_param(param_path)
+        model.load_param(args.ckpt.format(seed=seed))
+        vm, _ = model.evaluate(dl_valid)
+        tm, outputs = model.evaluate(dl_test)
+        record['eval'] = {'test': tm, 'valid': vm}
+        np.savez_compressed(os.path.join(args.result_dir, f'{args.tag}_{universe}_{seed}_eval_pred.npz'),
+                            **{k: v.astype(np.float32) for k, v in outputs.items() if k in keep or k == 'label_z'})
+    record['time'] = time.time() - start
+    summary = record.get('stop', record.get('eval', {})).get('test', {})
+    print('Seed %d (%s) %.0fs: %s' % (seed, args.tag, record['time'], {k: round(v, 4) for k, v in summary.items()}), flush=True)
+    with open(os.path.join(args.result_dir, f'{args.tag}_{universe}_{seed}.json'), 'w') as f:
+        json.dump(record, f, indent=1, default=float)
 
-    predictions, metrics = model.predict(dl_test)
-    running_time = time.time() - start
-
-    print('Seed: {:d} time cost : {:.2f} sec'.format(seed, running_time))
-    print(metrics, flush=True)
-
-    ic.append(metrics['IC'])
-    icir.append(metrics['ICIR'])
-    ric.append(metrics['RIC'])
-    ricir.append(metrics['RICIR'])
-    records.append({'seed': seed, 'epoch': model.fitted, 'time': running_time,
-                    'n_params': sum(p.numel() for p in model.model.parameters()),
-                    **{k: float(v) for k, v in metrics.items()},
-                    'history': getattr(model, 'history', [])})
-
-print("IC: {:.4f} pm {:.4f}".format(np.mean(ic), np.std(ic)))
-print("ICIR: {:.4f} pm {:.4f}".format(np.mean(icir), np.std(icir)))
-print("RIC: {:.4f} pm {:.4f}".format(np.mean(ric), np.std(ric)))
-print("RICIR: {:.4f} pm {:.4f}".format(np.mean(ricir), np.std(ricir)))
-
-if args.result_file:
-    os.makedirs(os.path.dirname(args.result_file) or '.', exist_ok=True)
-    with open(args.result_file, 'w') as f:
-        json.dump({'universe': universe, 'prefix': prefix, 'mode': args.mode,
-                   'model_kwargs': json.loads(args.model_kwargs), 'runs': records}, f, indent=2)
+# test-set index (shared by all prediction files of this universe)
+idx_file = os.path.join(args.result_dir, f'index_{universe}_test.npz')
+if not os.path.exists(idx_file):
+    index = dl_test.get_index()
+    np.savez_compressed(idx_file, instrument=np.asarray(index.get_level_values('instrument')).astype('U12'),
+                        datetime=index.get_level_values('datetime').values.astype('datetime64[D]'))

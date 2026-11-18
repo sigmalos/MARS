@@ -4,10 +4,7 @@ from torch.nn.modules.linear import Linear
 from torch.nn.modules.dropout import Dropout
 from torch.nn.modules.normalization import LayerNorm
 import math
-import os
 import numpy as np
-import pandas as pd
-from scipy import stats
 
 from base_model import SequenceModel
 
@@ -56,7 +53,7 @@ class SAttention(nn.Module):
             Dropout(p=dropout)
         )
 
-    def forward(self, x, tau=None):  # tau: [N, nhead] multiplicative logit scale (volatility-aware)
+    def forward(self, x):
         x = self.norm1(x)
         q = self.qtrans(x).transpose(0,1)
         k = self.ktrans(x).transpose(0,1)
@@ -74,10 +71,7 @@ class SAttention(nn.Module):
                 kh = k[:, :, i * dim:(i + 1) * dim]
                 vh = v[:, :, i * dim:(i + 1) * dim]
 
-            logits = torch.matmul(qh, kh.transpose(1, 2)) / self.temperature  # [T, N, N]
-            if tau is not None:
-                logits = logits * tau[:, i].view(1, -1, 1)
-            atten_ave_matrixh = torch.softmax(logits, dim=-1)
+            atten_ave_matrixh = torch.softmax(torch.matmul(qh, kh.transpose(1, 2)) / self.temperature, dim=-1)
             if self.attn_dropout:
                 atten_ave_matrixh = self.attn_dropout[i](atten_ave_matrixh)
             att_output.append(torch.matmul(atten_ave_matrixh, vh).transpose(0, 1))
@@ -119,7 +113,7 @@ class TAttention(nn.Module):
             Dropout(p=dropout)
         )
 
-    def forward(self, x, tau=None):  # tau: [N, nhead]
+    def forward(self, x):
         x = self.norm1(x)
         q = self.qtrans(x)
         k = self.ktrans(x)
@@ -136,10 +130,7 @@ class TAttention(nn.Module):
                 qh = q[:, :, i * dim:(i + 1) * dim]
                 kh = k[:, :, i * dim:(i + 1) * dim]
                 vh = v[:, :, i * dim:(i + 1) * dim]
-            logits = torch.matmul(qh, kh.transpose(1, 2))  # [N, T, T]
-            if tau is not None:
-                logits = logits * tau[:, i].view(-1, 1, 1)
-            atten_ave_matrixh = torch.softmax(logits, dim=-1)
+            atten_ave_matrixh = torch.softmax(torch.matmul(qh, kh.transpose(1, 2)), dim=-1)
             if self.attn_dropout:
                 atten_ave_matrixh = self.attn_dropout[i](atten_ave_matrixh)
             att_output.append(torch.matmul(atten_ave_matrixh, vh))
@@ -166,24 +157,6 @@ class Gate(nn.Module):
         return self.d_output*output
 
 
-# std of index daily returns over 5/10/20/30/60 days for CSI300, CSI500, CSI800 (positions inside the 63-dim
-# market-information block, see data/csi_market_information.csv)
-VOL_FEATURE_IDX = [2, 6, 10, 14, 18, 23, 27, 31, 35, 39, 44, 48, 52, 56, 60]
-
-
-class VolatilityEncoder(nn.Module):
-    """Direction D: encodes the market volatility state and outputs one temperature multiplier per attention
-    head, tau in (0, 2). tau > 1 sharpens the attention (focus on few stocks / days), tau < 1 smooths it."""
-    def __init__(self, d_input, n_out, d_hidden=32):
-        super().__init__()
-        self.net = nn.Sequential(nn.Linear(d_input, d_hidden), nn.ReLU(), nn.Linear(d_hidden, n_out))
-        nn.init.zeros_(self.net[-1].weight)  # tau == 1 at init -> identical to the original attention
-        nn.init.zeros_(self.net[-1].bias)
-
-    def forward(self, vol):
-        return 2 * torch.sigmoid(self.net(vol))
-
-
 class TemporalAttention(nn.Module):
     def __init__(self, d_model):
         super().__init__()
@@ -196,53 +169,6 @@ class TemporalAttention(nn.Module):
         lam = torch.softmax(lam, dim=1).unsqueeze(1)
         output = torch.matmul(lam, z).squeeze(1)  # [N, 1, T], [N, T, D] --> [N, 1, D]
         return output
-
-
-class MultiScaleTemporalConv(nn.Module):
-    """Direction A: parallel causal depthwise Conv1D branches with different kernel sizes / dilations
-    along the time axis, fused by concatenation + linear projection and added back residually."""
-    def __init__(self, d_model, kernels=(1, 3, 5), dilations=None, dropout=0.0):
-        super().__init__()
-        dilations = dilations or [1] * len(kernels)
-        self.pads = [(k - 1) * d for k, d in zip(kernels, dilations)]
-        self.branches = nn.ModuleList([
-            nn.Conv1d(d_model, d_model, kernel_size=k, dilation=d, groups=d_model)
-            for k, d in zip(kernels, dilations)
-        ])
-        self.act = nn.GELU()
-        self.fuse = nn.Linear(d_model * len(kernels), d_model)
-        nn.init.zeros_(self.fuse.weight)  # start as identity mapping of the original model
-        nn.init.zeros_(self.fuse.bias)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x):  # x: [N, T, D]
-        h = x.transpose(1, 2)  # [N, D, T]
-        outs = [self.act(conv(nn.functional.pad(h, (p, 0)))) for conv, p in zip(self.branches, self.pads)]
-        h = torch.cat(outs, dim=1).transpose(1, 2)  # [N, T, D*K]
-        return x + self.dropout(self.fuse(h))
-
-
-class DynamicMarketGate(nn.Module):
-    """Direction B: market-state encoder (GRU over the T-step market-information sequence) that produces
-    time-step specific gate logits. They are added to the original static gate logits, so the feature
-    weights change with the evolving market state instead of being a single vector for the whole window."""
-    def __init__(self, static_gate, d_input, d_output, d_hidden=64, beta=1.0):
-        super().__init__()
-        self.static_gate = static_gate
-        self.encoder = nn.GRU(d_input, d_hidden, batch_first=True)
-        self.dyn = nn.Linear(d_hidden, d_output)
-        nn.init.zeros_(self.dyn.weight)  # starts identical to the original gate
-        nn.init.zeros_(self.dyn.bias)
-        self.d_output = d_output
-        self.t = beta
-
-    def forward(self, market_seq):  # [N, T, F']
-        # Market information is (almost always) identical across stocks of a day; it differs only for stocks
-        # with suspended days whose look-back window covers other dates, so we encode per stock.
-        h, _ = self.encoder(market_seq)                                           # [N, T, H]
-        static_logit = self.static_gate.trans(market_seq[:, -1, :]).unsqueeze(1)  # [N, 1, D]
-        logit = static_logit + self.dyn(h)                                        # [N, T, D]
-        return self.d_output * torch.softmax(logit / self.t, dim=-1)
 
 
 class GraphAttention(nn.Module):
@@ -287,14 +213,52 @@ class GatedFusion(nn.Module):
         return s_out + torch.sigmoid(self.gate(torch.cat([s_out, g_out], dim=-1))) * g_out
 
 
+class RelationAttention(nn.Module):
+    """Relation-level (semantic) attention: alpha_r = softmax_r( q^T tanh(W H_r + b) ), computed per stock and
+    time step; H_graph = sum_r alpha_r H_r. q is zero-initialised, i.e. all relations start with equal weight."""
+    def __init__(self, d_model, d_hidden=64):
+        super().__init__()
+        self.proj = nn.Linear(d_model, d_hidden)
+        self.q = nn.Linear(d_hidden, 1, bias=False)
+        nn.init.zeros_(self.q.weight)
+
+    def forward(self, hs):
+        H = torch.stack(hs, dim=-2)                                     # [N, T, R, D]
+        alpha = torch.softmax(self.q(torch.tanh(self.proj(H))).squeeze(-1), dim=-1)  # [N, T, R]
+        return (alpha.unsqueeze(-1) * H).sum(dim=-2), alpha
+
+
+class MultiRelationGAT(nn.Module):
+    """One GAT per relation graph (own parameters), fused by relation-level attention."""
+    def __init__(self, relations, d_model, nhead, dropout, rel_hidden=64):
+        super().__init__()
+        self.relations = list(relations)
+        self.gats = nn.ModuleDict({r: GraphAttention(d_model, nhead, dropout) for r in self.relations})
+        self.rel_attn = RelationAttention(d_model, rel_hidden) if len(self.relations) > 1 else None
+
+    def forward(self, h, adjs):
+        hs = [self.gats[r](h, adjs[r]) for r in self.relations]
+        if self.rel_attn is None:
+            return hs[0], None
+        return self.rel_attn(hs)
+
+
+# relation name -> (kind, array name in the relation files built by scripts/build_relations.py)
+RELATIONS = {
+    'ind':  ('cat', 'csrc'),       # CSRC industry, point-in-time (baostock monthly snapshots)
+    'corr': ('knn', 'corr10'),     # top-10 Pearson correlation of the previous 60 daily returns
+    'fine': ('cat', 'sw2'),        # Shenwan level-2, point-in-time (cninfo change history)
+    'sw1':  ('cat', 'sw1'),        # Shenwan level-1 (granularity study)
+    'sw3':  ('cat', 'sw3'),        # Shenwan level-3 (granularity study)
+    'snap': ('cat', 'csrc_snap'),  # CSRC industry, 2026-11 snapshot back-filled (= pre-experiment graph)
+    'rand': ('cat', 'csrc_rand'),  # control: point-in-time CSRC labels of a randomly permuted stock
+}
+CANONICAL_ORDER = list(RELATIONS)
+
+
 class MASTER(nn.Module):
-    """MASTER with switchable improvement modules:
-    A ms_kernels   multi-scale temporal Conv1D      B dyn_gate     dynamic market-state feature gate
-    C use_gat      industry-graph GAT               D vol_attn     volatility-aware attention temperature
-    E uncertainty  mean + log-variance output"""
     def __init__(self, d_feat, d_model, t_nhead, s_nhead, T_dropout_rate, S_dropout_rate, gate_input_start_index, gate_input_end_index, beta,
-                 ms_kernels=(), ms_dilations=None, ms_dropout=0.0, dyn_gate=False, dyn_gate_hidden=64,
-                 use_gat=False, gat_nhead=2, gat_dropout=0.1, vol_attn=False, vol_hidden=32, uncertainty=False):
+                 relations=(), gat_nhead=2, gat_dropout=0.1, rel_hidden=64, joint_unc=None, unc_hidden=64):
         super(MASTER, self).__init__()
         # market
         self.gate_input_start_index = gate_input_start_index
@@ -314,66 +278,44 @@ class MASTER(nn.Module):
             # decoder
             nn.Linear(d_model, 1)
         )
-        # improvement modules, created after the original layers (identical init of shared parameters per seed)
-        self.use_ms = bool(ms_kernels)
-        if self.use_ms:
-            self.multiscale = MultiScaleTemporalConv(d_model, ms_kernels, ms_dilations, ms_dropout)
-        self.use_dyn_gate = dyn_gate
-        if dyn_gate:
-            self.dyn_gate = DynamicMarketGate(self.feature_gate, self.d_gate_input, d_feat, dyn_gate_hidden, beta)
-        self.use_gat = use_gat
-        if use_gat:
-            self.gat = GraphAttention(d_model, gat_nhead, gat_dropout)
+        # new modules are created after the original layers -> identical init of shared parameters per seed
+        self.relations = [r for r in CANONICAL_ORDER if r in relations]
+        if self.relations:
+            self.graph = MultiRelationGAT(self.relations, d_model, gat_nhead, gat_dropout, rel_hidden)
             self.gat_fusion = GatedFusion(d_model)
-        self.use_vol = vol_attn
-        self.t_nhead = t_nhead
-        if vol_attn:
-            self.vol_idx = [gate_input_start_index + i for i in VOL_FEATURE_IDX]
-            self.vol_encoder = VolatilityEncoder(len(self.vol_idx), t_nhead + s_nhead, vol_hidden)
-        self.uncertainty = uncertainty
-        if uncertainty:
-            self.logvar_head = nn.Linear(d_model, 1)
-            nn.init.zeros_(self.logvar_head.weight)
-            nn.init.zeros_(self.logvar_head.bias)
+        self.unc_head = None
+        if joint_unc:
+            from uncertainty import ScaleHead
+            self.unc_head = ScaleHead(d_model, unc_hidden, dist=joint_unc)
 
-    def forward(self, x, adj=None):
+    def forward(self, x, adjs=None, return_repr=False):
         src = x[:, :, :self.gate_input_start_index] # N, T, D
-        market = x[:, :, self.gate_input_start_index:self.gate_input_end_index]
-        if self.use_dyn_gate:                                         # B
-            src = src * self.dyn_gate(market)
-        else:
-            src = src * torch.unsqueeze(self.feature_gate(market[:, -1, :]), dim=1)
+        gate_input = x[:, -1, self.gate_input_start_index:self.gate_input_end_index]
+        src = src * torch.unsqueeze(self.feature_gate(gate_input), dim=1)
 
-        tau_t = tau_s = None
-        if self.use_vol:                                              # D
-            tau = self.vol_encoder(x[:, -1, self.vol_idx])
-            tau_t, tau_s = tau[:, :self.t_nhead], tau[:, self.t_nhead:]
-
-        h = self.layers[1](self.layers[0](src))
-        if self.use_ms:                                               # A
-            h = self.multiscale(h)
-        h = self.layers[2](h, tau_t)
-        s_out = self.layers[3](h, tau_s)
-        if self.use_gat and adj is not None:                          # C
-            s_out = self.gat_fusion(s_out, self.gat(h, adj))
-        z = self.layers[4](s_out)
-        mu = self.layers[5](z).squeeze(-1)
-        if not self.uncertainty:
-            return mu
-        raw = self.logvar_head(z).squeeze(-1)                         # E
-        return mu, 6.0 * torch.tanh(raw / 6.0)
-
-
-MODULE_KWARGS = ['ms_kernels', 'ms_dilations', 'ms_dropout', 'dyn_gate', 'dyn_gate_hidden', 'use_gat', 'gat_nhead',
-                 'gat_dropout', 'vol_attn', 'vol_hidden', 'uncertainty']
+        h = self.layers[2](self.layers[1](self.layers[0](src)))   # feature layer, PE, intra-stock T-Attention
+        s = self.layers[3](h)                                      # inter-stock S-Attention
+        out = {}
+        if self.relations and adjs is not None:
+            g, alpha = self.graph(h, adjs)                         # multi-relation GAT on the same input
+            s = self.gat_fusion(s, g)                              # H_SA + gamma * H_graph
+            if alpha is not None:
+                out['rel_alpha'] = alpha.mean(dim=1)               # [N, R], averaged over time steps
+        z = self.layers[4](s)                                      # temporal aggregation -> [N, D]
+        out['pred'] = self.layers[5](z).squeeze(-1)
+        if self.unc_head is not None:
+            out.update(self.unc_head(z))
+        if return_repr:
+            out['repr'] = z
+        return out
 
 
 class MASTERModel(SequenceModel):
     def __init__(
             self, d_feat, d_model, t_nhead, s_nhead, gate_input_start_index, gate_input_end_index,
-            T_dropout_rate, S_dropout_rate, beta, nll_beta=0.0, industry_file=None, **kwargs,
+            T_dropout_rate, S_dropout_rate, beta, relations=(), gat_nhead=2, gat_dropout=0.1, rel_hidden=64,
+            joint_unc=None, unc_hidden=64, **kwargs,
     ):
-        self.module_kwargs = {k: kwargs.pop(k) for k in MODULE_KWARGS if k in kwargs}
         super(MASTERModel, self).__init__(**kwargs)
         self.d_model = d_model
         self.d_feat = d_feat
@@ -386,16 +328,11 @@ class MASTERModel(SequenceModel):
         self.t_nhead = t_nhead
         self.s_nhead = s_nhead
         self.beta = beta
-        self.uncertainty = self.module_kwargs.get('uncertainty', False)
-        self.use_gat = self.module_kwargs.get('use_gat', False)
-        self.nll_beta = nll_beta
-
-        if self.use_gat:
-            industry_file = industry_file or os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'stock_industry.csv')
-            ind = pd.read_csv(industry_file).fillna({'industry': ''})
-            ind = ind[ind['industry'] != '']
-            codes = {name: i for i, name in enumerate(sorted(ind['industry'].unique()))}
-            self.industry_of = dict(zip(ind['instrument'], ind['industry'].map(codes)))
+        unknown = set(relations) - set(RELATIONS)
+        assert not unknown, f'unknown relations {unknown}'
+        self.relations = [r for r in CANONICAL_ORDER if r in relations]
+        self.gat_nhead, self.gat_dropout, self.rel_hidden = gat_nhead, gat_dropout, rel_hidden
+        self.joint_unc, self.unc_hidden = joint_unc, unc_hidden
 
         self.init_model()
 
@@ -403,65 +340,42 @@ class MASTERModel(SequenceModel):
         self.model = MASTER(d_feat=self.d_feat, d_model=self.d_model, t_nhead=self.t_nhead, s_nhead=self.s_nhead,
                                    T_dropout_rate=self.T_dropout_rate, S_dropout_rate=self.S_dropout_rate,
                                    gate_input_start_index=self.gate_input_start_index,
-                                   gate_input_end_index=self.gate_input_end_index, beta=self.beta, **self.module_kwargs)
+                                   gate_input_end_index=self.gate_input_end_index, beta=self.beta,
+                                   relations=self.relations, gat_nhead=self.gat_nhead, gat_dropout=self.gat_dropout,
+                                   rel_hidden=self.rel_hidden, joint_unc=self.joint_unc, unc_hidden=self.unc_hidden)
         super(MASTERModel, self).init_model()
 
-    def build_adj(self, inst):
-        ids = torch.tensor([self.industry_of.get(c, -1) for c in inst], device=self.device)
-        adj = (ids[:, None] == ids[None, :]) & (ids[:, None] >= 0)
-        return adj | torch.eye(len(inst), dtype=torch.bool, device=self.device)
+    def build_adjs(self, info, keep=None):
+        adjs = {}
+        n = len(info['inst'])
+        eye = torch.eye(n, dtype=torch.bool, device=self.device)
+        for r in self.relations:
+            kind, key = RELATIONS[r]
+            arr = torch.from_numpy(np.ascontiguousarray(info['rel'][key])).to(self.device)
+            if kind == 'cat':
+                adj = (arr[:, None] == arr[None, :]) & (arr[:, None] >= 0)
+            else:  # knn: arr[i] = positions (within the day) of the neighbours of stock i, -1 = none
+                adj = torch.zeros(n, n, dtype=torch.bool, device=self.device)
+                rows = torch.arange(n, device=self.device).repeat_interleave(arr.shape[1])
+                cols = arr.reshape(-1).long()
+                ok = cols >= 0
+                adj[rows[ok], cols[ok]] = True
+            adj = adj | eye
+            if keep is not None:
+                adj = adj[keep][:, keep]
+            adjs[r] = adj
+        return adjs
 
-    def _forward(self, feature, inst=None):
-        adj = self.build_adj(inst) if (self.use_gat and inst is not None) else None
-        out = self.model(feature, adj)
-        if not self.uncertainty:
-            return {'pred': out}
-        return {'pred': out[0], 'logvar': out[1]}
+    def _forward(self, feature, info, keep=None, return_repr=False):
+        adjs = self.build_adjs(info, keep) if self.relations else None
+        return self.model(feature, adjs, return_repr=return_repr)
 
     def _train_loss(self, out, label):
         mse = self.loss_fn(out['pred'], label)
-        if not self.uncertainty:
+        if self.joint_unc is None:
             return mse, mse
-        mask = ~torch.isnan(label)
-        mu, logvar, y = out['pred'][mask], out['logvar'][mask], label[mask]
-        nll = 0.5 * (logvar + (y - mu) ** 2 * torch.exp(-logvar))
-        if self.nll_beta > 0:
-            nll = nll * torch.exp(logvar).detach() ** self.nll_beta
-        # backprop the (beta-)NLL, but keep the MSE of the mean for the common stop criterion
+        from uncertainty import nll_torch
+        m = ~torch.isnan(label)
+        nll = nll_torch(label[m], out['pred'][m], out['scale'][m], out.get('nu', None)[m] if 'nu' in out else None)
+        # backprop the NLL jointly, keep the MSE of the mean for the common stop criterion
         return nll.mean(), mse
-
-    def _extra_metrics(self, outs, labels):
-        if not self.uncertainty:
-            return {}
-        res = {}
-        mu = np.concatenate([o['pred'].ravel() for o in outs])
-        sig = np.exp(0.5 * np.concatenate([o['logvar'].ravel() for o in outs]))
-        y = np.concatenate(labels)
-        v = ~np.isnan(y)
-        mu, sig, y = mu[v], sig[v], y[v]
-        err = np.abs(y - mu)
-        for name, z in [('68', 1.0), ('90', 1.6449), ('95', 1.96)]:
-            res[f'PICP{name}'] = float(np.mean(err <= z * sig))
-            res[f'MPIW{name}'] = float(np.mean(2 * z * sig))
-            # reference: constant sigma = 1 (std of the z-scored label), i.e. no uncertainty model
-            res[f'PICP{name}_const'] = float(np.mean(err <= z))
-        res['NLL'] = float(np.mean(0.5 * np.log(2 * np.pi * sig ** 2) + 0.5 * (err / sig) ** 2))
-        res['NLL_const'] = float(np.mean(0.5 * np.log(2 * np.pi) + 0.5 * err ** 2))
-        res['sigma_mean'] = float(sig.mean())
-        res['sigma_std'] = float(sig.std())
-        res['corr_sigma_abserr'] = float(stats.spearmanr(sig, err)[0])
-        # per-day: correlation of sigma with |error| and IC of the confident / unconfident half
-        cs, ic_lo, ic_hi = [], [], []
-        for o, lab in zip(outs, labels):
-            m = ~np.isnan(lab)
-            if m.sum() < 20:
-                continue
-            p, s_, l = o['pred'].ravel()[m], np.exp(0.5 * o['logvar'].ravel()[m]), lab[m]
-            cs.append(stats.spearmanr(s_, np.abs(l - p))[0])
-            lo = s_ <= np.median(s_)
-            ic_lo.append(np.corrcoef(p[lo], l[lo])[0, 1])
-            ic_hi.append(np.corrcoef(p[~lo], l[~lo])[0, 1])
-        res['daily_corr_sigma_abserr'] = float(np.nanmean(cs))
-        res['IC_low_sigma_half'] = float(np.nanmean(ic_lo))
-        res['IC_high_sigma_half'] = float(np.nanmean(ic_hi))
-        return res

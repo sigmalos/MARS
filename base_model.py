@@ -1,68 +1,119 @@
 import os
 import time
+import copy
 import numpy as np
 import pandas as pd
-import copy
+from scipy.stats import rankdata
 
-from torch.utils.data import Sampler
 import torch
 import torch.optim as optim
 
-def calc_ic(pred, label):
-    df = pd.DataFrame({'pred':pred, 'label':label})
-    ic = df['pred'].corr(df['label'])
-    ric = df['pred'].corr(df['label'], method='spearman')
-    return ic, ric
 
 def zscore(x):
     return (x - x.mean()).div(x.std())
 
+
 def drop_extreme(x):
     sorted_tensor, indices = x.sort()
     N = x.shape[0]
-    percent_2_5 = int(0.025*N)  
+    percent_2_5 = int(0.025*N)
     # Exclude top 2.5% and bottom 2.5% values
     filtered_indices = indices[percent_2_5:-percent_2_5]
     mask = torch.zeros_like(x, device=x.device, dtype=torch.bool)
     mask[filtered_indices] = True
     return mask, x[mask]
 
-def drop_na(x):
-    mask = ~x.isnan()
-    return mask, x[mask]
 
-class DailyBatchSamplerRandom(Sampler):
-    def __init__(self, data_source, shuffle=False):
-        self.data_source = data_source
-        self.shuffle = shuffle
-        # calculate number of samples in each batch
-        self.daily_count = pd.Series(index=self.data_source.get_index()).groupby("datetime").size().values
-        self.daily_index = np.roll(np.cumsum(self.daily_count), 1)  # calculate begin index of each batch
-        self.daily_index[0] = 0
+def daily_ic(pred, label):
+    """Pearson / Spearman correlation of one cross-section, NaN labels ignored (same as pandas .corr)."""
+    m = ~np.isnan(label)
+    p, l = pred[m], label[m]
+    if len(l) < 2:
+        return np.nan, np.nan
+    ic = np.corrcoef(p, l)[0, 1]
+    ric = np.corrcoef(rankdata(p), rankdata(l))[0, 1]
+    return ic, ric
 
-    def __iter__(self):
-        if self.shuffle:
-            index = np.arange(len(self.daily_count))
-            np.random.shuffle(index)
-            for i in index:
-                yield np.arange(self.daily_index[i], self.daily_index[i] + self.daily_count[i])
-        else:
-            for idx, count in zip(self.daily_index, self.daily_count):
-                yield np.arange(idx, idx + count)
+
+def cs_zscore_np(label):
+    """Cross-sectional z-score over the non-NaN labels of one day (NaN kept)."""
+    z = np.full_like(label, np.nan)
+    v = ~np.isnan(label)
+    if v.sum() > 1:
+        z[v] = (label[v] - label[v].mean()) / label[v].std(ddof=1)
+    return z
+
+
+def _ffill_rows(a):
+    """Row-wise forward fill of NaN (vectorised version of qlib.data.dataset.np_ffill)."""
+    mask = np.isnan(a)
+    idx = np.where(~mask, np.arange(a.shape[1])[None, :], 0)
+    np.maximum.accumulate(idx, axis=1, out=idx)
+    return np.take_along_axis(a, idx, axis=1)
+
+
+class DayBatches:
+    """All samples of one trading day form one batch (as in the official DailyBatchSamplerRandom).
+
+    The [N, T, F] tensor of a day is gathered with pre-computed index arrays instead of calling
+    TSDataSampler.__getitem__ sample by sample; the result is bit-identical (checked in tests) but
+    several times faster. Relation arrays attached to the dataset (see relations.py) are sliced per day.
+    """
+
+    def __init__(self, ds):
+        fillna_type = getattr(ds, 'fillna_type', 'none')
+        assert fillna_type in ('none', 'ffill', 'ffill+bfill')
+        index = ds.get_index()
+        self.ds = ds
+        self.instruments = np.asarray(index.get_level_values('instrument'))
+        dates = index.get_level_values('datetime')
+        assert (np.diff(dates.values.astype('int64')) >= 0).all(), 'index must be sorted by datetime'
+        counts = pd.Series(index=index, dtype=float).groupby('datetime').size()
+        self.day_dates = counts.index
+        self.counts = counts.values
+        self.starts = np.r_[0, np.cumsum(self.counts)[:-1]]
+        rc = np.asarray(ds.idx_map)
+        if rc.dtype == object:
+            rc = np.array([tuple(x) for x in rc])
+        rows, cols = rc[:, 0].astype(np.int64), rc[:, 1].astype(np.int64)
+        win = rows[:, None] + np.arange(-ds.step_len + 1, 1)[None, :]
+        ind = ds.idx_arr[np.clip(win, 0, None), cols[:, None]].astype(np.float64)
+        ind[win < 0] = np.nan
+        if fillna_type == 'ffill':
+            ind = _ffill_rows(ind)
+        elif fillna_type == 'ffill+bfill':
+            ind = _ffill_rows(_ffill_rows(ind)[:, ::-1])[:, ::-1]
+        self.sample_idx = np.nan_to_num(ind, nan=ds.nan_idx).astype(np.int64)  # [n_samples, T]
+        self.relations = getattr(ds, 'relation_arrays', {})
 
     def __len__(self):
-        return len(self.data_source)
+        return len(self.counts)
+
+    def order(self, shuffle):
+        index = np.arange(len(self.counts))
+        if shuffle:
+            np.random.shuffle(index)  # same RNG usage as the official sampler
+        return index
+
+    def get(self, k):
+        s, n = self.starts[k], self.counts[k]
+        data = self.ds.data_arr[self.sample_idx[s:s + n]]  # [N, T, F]
+        rel = {name: arr[s:s + n] for name, arr in self.relations.items()}
+        return torch.from_numpy(data), {'inst': self.instruments[s:s + n], 'date': self.day_dates[k], 'rel': rel,
+                                        'slice': (s, n)}
 
 
 class SequenceModel():
-    def __init__(self, n_epochs, lr, GPU=None, seed=None, train_stop_loss_thred=None, save_path = 'model/', save_prefix= '', drop_extreme_label=True):
+    def __init__(self, n_epochs, lr, GPU=None, seed=None, train_stop_loss_thred=None, save_path='model/', save_prefix='',
+                 drop_extreme_label=True, select_metric='IC'):
         self.n_epochs = n_epochs
-        # True for opensource training data; False for original training data (already processed when dumped).
-        self.drop_extreme_label = drop_extreme_label
         self.lr = lr
         self.device = torch.device(f"cuda:{GPU}" if torch.cuda.is_available() else "cpu")
         self.seed = seed
         self.train_stop_loss_thred = train_stop_loss_thred
+        # True for opensource training data; False for original training data (already processed when dumped).
+        self.drop_extreme_label = drop_extreme_label
+        self.select_metric = select_metric
 
         if self.seed is not None:
             np.random.seed(self.seed)
@@ -76,7 +127,7 @@ class SequenceModel():
 
         self.save_path = save_path
         self.save_prefix = save_prefix
-
+        self._batch_cache = {}
 
     def init_model(self):
         if self.model is None:
@@ -91,10 +142,11 @@ class SequenceModel():
         return torch.mean(loss)
 
     # ------------------------------------------------------------------
-    # Hooks that improved variants may override.
+    # Hooks that improved variants override.
     # ------------------------------------------------------------------
-    def _forward(self, feature, inst=None):
-        """Run the network. Returns a dict with at least key 'pred' (N,)."""
+    def _forward(self, feature, info, keep=None, return_repr=False):
+        """Run the network on one day. `keep` (bool mask over the day's samples) is set when extreme labels
+        were dropped during training. Returns a dict with at least key 'pred' (N,)."""
         return {'pred': self.model(feature)}
 
     def _train_loss(self, out, label):
@@ -102,22 +154,19 @@ class SequenceModel():
         loss = self.loss_fn(out['pred'], label)
         return loss, loss
 
-    def _extra_metrics(self, outs, labels):
-        """outs/labels: per-day lists (label is cross-sectionally z-scored, NaN kept). Returns dict."""
-        return {}
+    def batches(self, dataset):
+        key = id(dataset)
+        if key not in self._batch_cache:
+            self._batch_cache[key] = DayBatches(dataset)
+        return self._batch_cache[key]
 
-    def _iter_batches(self, dataset, shuffle):
-        """Yields (data[N,T,F] tensor, instrument codes[N]) for each trading day."""
-        sampler = DailyBatchSamplerRandom(dataset, shuffle)
-        instruments = np.asarray(dataset.get_index().get_level_values('instrument'))
-        for idx in sampler:
-            yield torch.from_numpy(dataset[idx]), instruments[idx]
-
+    # ------------------------------------------------------------------
     def train_epoch(self, dataset):
         self.model.train()
         losses = []
-
-        for data, inst in self._iter_batches(dataset, shuffle=True):
+        db = self.batches(dataset)
+        for k in db.order(shuffle=True):
+            data, info = db.get(k)
             '''
             data.shape: (N, T, F)
             N - number of stocks
@@ -127,18 +176,14 @@ class SequenceModel():
             feature = data[:, :, 0:-1].to(self.device)
             label = data[:, -1, -1].to(self.device)
 
-            # Additional process on labels
-            # If you use original data to train, you won't need the following lines because we already drop extreme when we dumped the data.
-            # If you use the opensource data to train, use the following lines to drop extreme labels.
-            #########################
+            keep = None
+            # Additional process on labels (opensource data): drop extreme labels and CSZScoreNorm.
             if self.drop_extreme_label:
-                mask, label = drop_extreme(label)
-                feature = feature[mask, :, :]
-                inst = inst[mask.cpu().numpy()]
-                label = zscore(label) # CSZscoreNorm
-            #########################
+                keep, label = drop_extreme(label)
+                feature = feature[keep, :, :]
+                label = zscore(label)
 
-            out = self._forward(feature.float(), inst)
+            out = self._forward(feature.float(), info, keep)
             loss, monitor = self._train_loss(out, label)
             losses.append(monitor.item())
 
@@ -149,86 +194,93 @@ class SequenceModel():
 
         return float(np.mean(losses))
 
+    def evaluate(self, dataset, return_repr=False):
+        """Predict every sample of `dataset` (all stocks, NaN labels only ignored in the metrics).
+        Returns (metrics, outputs) where outputs maps name -> array aligned with dataset.get_index()."""
+        db = self.batches(dataset)
+        n = len(db.instruments)
+        outputs, labels = {}, np.full(n, np.nan, dtype=np.float32)
+        ic, ric = [], []
+        self.model.eval()
+        with torch.no_grad():
+            for k in db.order(shuffle=False):
+                data, info = db.get(k)
+                s, cnt = info['slice']
+                feature = data[:, :, 0:-1].to(self.device)
+                label = data[:, -1, -1].numpy()
+                out = self._forward(feature.float(), info, None, return_repr=return_repr)
+                for name, v in out.items():
+                    v = v.detach().cpu().numpy()
+                    if v.ndim >= 1 and v.shape[0] == cnt:
+                        if name not in outputs:
+                            outputs[name] = np.zeros((n,) + v.shape[1:], dtype=np.float32)
+                        outputs[name][s:s + cnt] = v
+                labels[s:s + cnt] = cs_zscore_np(label)
+                a, b = daily_ic(out['pred'].detach().cpu().numpy(), label)
+                ic.append(a)
+                ric.append(b)
+        ic, ric = np.array(ic), np.array(ric)
+        v = ~np.isnan(labels)
+        err = outputs['pred'][v] - labels[v]
+        metrics = {
+            'IC': float(np.nanmean(ic)), 'ICIR': float(np.nanmean(ic) / np.nanstd(ic)),
+            'RIC': float(np.nanmean(ric)), 'RICIR': float(np.nanmean(ric) / np.nanstd(ric)),
+            'MSE': float(np.mean(err ** 2)), 'MAE': float(np.mean(np.abs(err))),
+        }
+        outputs['label_z'] = labels
+        return metrics, outputs
+
+    def predict(self, dl_test):
+        metrics, outputs = self.evaluate(dl_test)
+        return pd.Series(outputs['pred'], index=dl_test.get_index()), metrics
+
     def load_param(self, param_path):
-        self.model.load_state_dict(torch.load(param_path, map_location=self.device))
+        self.model.load_state_dict(torch.load(param_path, map_location=self.device, weights_only=True))
         self.fitted = 'Previously trained.'
 
-    def fit(self, dl_train, dl_valid=None, dl_test=None):
-        """dl_test (optional) is only *evaluated* after every epoch for offline analysis of the
-        training dynamics; it never influences training or stopping."""
-        best_param = None
-        self.history = []
+    def fit(self, dl_train, dl_valid=None, dl_test=None, full_epochs=True, keep_outputs=('pred',)):
+        """Train for n_epochs. Two model-selection protocols are recorded from the same trajectory:
+          * 'stop': official MASTER criterion - first epoch with train loss <= train_stop_loss_thred
+                    (last epoch if never reached). With full_epochs=False training ends there, exactly as the
+                    official code; with full_epochs=True training continues, which does not change the
+                    trajectory up to that epoch (evaluation consumes no randomness).
+          * 'best': epoch with the best validation `select_metric`.
+        dl_test is only *evaluated* (stored for the selected epochs); it never influences training/selection."""
         os.makedirs(self.save_path, exist_ok=True)
+        self.history, self.selected = [], {}
+        best_val = -np.inf
         for step in range(self.n_epochs):
             t0 = time.time()
             train_loss = self.train_epoch(dl_train)
             self.fitted = step
-            rec = {'epoch': step, 'train_loss': train_loss, 'time': time.time() - t0}
-            if dl_valid:
-                predictions, metrics = self.predict(dl_valid)
-                rec.update({f'valid_{k}': float(v) for k, v in metrics.items()})
-                print("Epoch %d, train_loss %.6f, valid ic %.4f, icir %.3f, rankic %.4f, rankicir %.3f, %.0fs." % (step, train_loss, metrics['IC'],  metrics['ICIR'],  metrics['RIC'],  metrics['RICIR'], rec['time']), flush=True)
-            else: print("Epoch %d, train_loss %.6f" % (step, train_loss), flush=True)
+            rec = {'epoch': step, 'train_loss': train_loss}
+            vm, _ = self.evaluate(dl_valid)
+            rec.update({f'valid_{k}': v for k, v in vm.items()})
+            test_out = None
             if dl_test is not None:
-                _, tm = self.predict(dl_test)
-                rec.update({f'test_{k}': float(v) for k, v in tm.items()})
+                tm, test_out = self.evaluate(dl_test)
+                rec.update({f'test_{k}': v for k, v in tm.items()})
+            rec['time'] = time.time() - t0
             self.history.append(rec)
+            print("Epoch %d, train_loss %.6f, valid ic %.4f, rankic %.4f | test ic %.4f, rankic %.4f, %.0fs." % (
+                step, train_loss, vm['IC'], vm['RIC'], rec.get('test_IC', np.nan), rec.get('test_RIC', np.nan), rec['time']), flush=True)
 
-            if train_loss <= self.train_stop_loss_thred:
-                best_param = copy.deepcopy(self.model.state_dict())
-                torch.save(best_param, f'{self.save_path}/{self.save_prefix}_{self.seed}.pkl')
-                break
-
-
-    def predict(self, dl_test):
-        if not isinstance(self.fitted, str) and self.fitted<0:
-            raise ValueError("model is not fitted yet!")
-
-        preds = []
-        ic = []
-        ric = []
-        outs, labels = [], []
-
-        self.model.eval()
-        for data, inst in self._iter_batches(dl_test, shuffle=False):
-            feature = data[:, :, 0:-1].to(self.device)
-            label = data[:, -1, -1].numpy()
-
-            # nan label will be automatically ignored when compute metrics.
-            # zscorenorm will not affect the results of ranking-based metrics.
-
-            with torch.no_grad():
-                out = {k: v.detach().cpu().numpy() for k, v in self._forward(feature.float(), inst).items()}
-            pred = out['pred']
-            preds.append(pred.ravel())
-
-            daily_ic, daily_ric = calc_ic(pred, label)
-            ic.append(daily_ic)
-            ric.append(daily_ric)
-
-            # z-score the label cross-sectionally (as during training) for error-based metrics
-            valid = ~np.isnan(label)
-            zl = np.full_like(label, np.nan)
-            if valid.sum() > 1:
-                zl[valid] = (label[valid] - label[valid].mean()) / label[valid].std(ddof=1)
-            outs.append(out)
-            labels.append(zl)
-
-        predictions = pd.Series(np.concatenate(preds), index=dl_test.get_index())
-
-        all_pred = np.concatenate([o['pred'].ravel() for o in outs])
-        all_label = np.concatenate(labels)
-        v = ~np.isnan(all_label)
-        err = all_pred[v] - all_label[v]
-
-        metrics = {
-            'IC': np.mean(ic),
-            'ICIR': np.mean(ic)/np.std(ic),
-            'RIC': np.mean(ric),
-            'RICIR': np.mean(ric)/np.std(ric),
-            'MSE': float(np.mean(err ** 2)),
-            'MAE': float(np.mean(np.abs(err))),
-        }
-        metrics.update(self._extra_metrics(outs, labels))
-
-        return predictions, metrics
+            def snapshot():
+                return {'epoch': step, 'state': copy.deepcopy(self.model.state_dict()),
+                        'outputs': {k: v.copy() for k, v in (test_out or {}).items() if k in keep_outputs or k == 'label_z'},
+                        'test': {k[5:]: v for k, v in rec.items() if k.startswith('test_')},
+                        'valid': {k[6:]: v for k, v in rec.items() if k.startswith('valid_')}}
+            if vm[self.select_metric] > best_val:
+                best_val = vm[self.select_metric]
+                self.selected['best'] = snapshot()
+            reached = train_loss <= self.train_stop_loss_thred
+            if 'stop' not in self.selected and (reached or step == self.n_epochs - 1):
+                self.selected['stop'] = snapshot()
+                if not full_epochs:
+                    break
+        for name, sel in self.selected.items():
+            torch.save(sel['state'], f'{self.save_path}/{self.save_prefix}_{self.seed}_{name}.pkl')
+        # leave the model in the official-criterion state
+        self.model.load_state_dict(self.selected['stop']['state'])
+        self.fitted = self.selected['stop']['epoch']
+        return self.selected
