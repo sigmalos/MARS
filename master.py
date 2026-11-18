@@ -170,8 +170,33 @@ class TemporalAttention(nn.Module):
         return output
 
 
+class MultiScaleTemporalConv(nn.Module):
+    """Direction A: parallel causal depthwise Conv1D branches with different kernel sizes / dilations
+    along the time axis, fused by concatenation + linear projection and added back residually."""
+    def __init__(self, d_model, kernels=(1, 3, 5), dilations=None, dropout=0.0):
+        super().__init__()
+        dilations = dilations or [1] * len(kernels)
+        self.pads = [(k - 1) * d for k, d in zip(kernels, dilations)]
+        self.branches = nn.ModuleList([
+            nn.Conv1d(d_model, d_model, kernel_size=k, dilation=d, groups=d_model)
+            for k, d in zip(kernels, dilations)
+        ])
+        self.act = nn.GELU()
+        self.fuse = nn.Linear(d_model * len(kernels), d_model)
+        nn.init.zeros_(self.fuse.weight)  # start as identity mapping of the original model
+        nn.init.zeros_(self.fuse.bias)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):  # x: [N, T, D]
+        h = x.transpose(1, 2)  # [N, D, T]
+        outs = [self.act(conv(nn.functional.pad(h, (p, 0)))) for conv, p in zip(self.branches, self.pads)]
+        h = torch.cat(outs, dim=1).transpose(1, 2)  # [N, T, D*K]
+        return x + self.dropout(self.fuse(h))
+
+
 class MASTER(nn.Module):
-    def __init__(self, d_feat, d_model, t_nhead, s_nhead, T_dropout_rate, S_dropout_rate, gate_input_start_index, gate_input_end_index, beta):
+    def __init__(self, d_feat, d_model, t_nhead, s_nhead, T_dropout_rate, S_dropout_rate, gate_input_start_index, gate_input_end_index, beta,
+                 ms_kernels=(1, 3, 5), ms_dilations=None, ms_dropout=0.0):
         super(MASTER, self).__init__()
         # market
         self.gate_input_start_index = gate_input_start_index
@@ -191,13 +216,22 @@ class MASTER(nn.Module):
             # decoder
             nn.Linear(d_model, 1)
         )
+        # created after the original layers so that the shared parameters get identical init for a given seed
+        self.use_ms = bool(ms_kernels)
+        if self.use_ms:
+            self.multiscale = MultiScaleTemporalConv(d_model, ms_kernels, ms_dilations, ms_dropout)
 
     def forward(self, x):
         src = x[:, :, :self.gate_input_start_index] # N, T, D
         gate_input = x[:, -1, self.gate_input_start_index:self.gate_input_end_index]
         src = src * torch.unsqueeze(self.feature_gate(gate_input), dim=1)
        
-        output = self.layers(src).squeeze(-1)
+        h = self.layers[1](self.layers[0](src))   # feature layer + positional encoding
+        if self.use_ms:
+            h = self.multiscale(h)                 # multi-scale temporal features
+        for layer in self.layers[2:]:
+            h = layer(h)
+        output = h.squeeze(-1)
 
         return output
 
@@ -205,7 +239,7 @@ class MASTER(nn.Module):
 class MASTERModel(SequenceModel):
     def __init__(
             self, d_feat, d_model, t_nhead, s_nhead, gate_input_start_index, gate_input_end_index,
-            T_dropout_rate, S_dropout_rate, beta, **kwargs,
+            T_dropout_rate, S_dropout_rate, beta, ms_kernels=(1, 3, 5), ms_dilations=None, ms_dropout=0.0, **kwargs,
     ):
         super(MASTERModel, self).__init__(**kwargs)
         self.d_model = d_model
@@ -219,6 +253,7 @@ class MASTERModel(SequenceModel):
         self.t_nhead = t_nhead
         self.s_nhead = s_nhead
         self.beta = beta
+        self.ms_kernels, self.ms_dilations, self.ms_dropout = ms_kernels, ms_dilations, ms_dropout
 
         self.init_model()
 
@@ -226,5 +261,6 @@ class MASTERModel(SequenceModel):
         self.model = MASTER(d_feat=self.d_feat, d_model=self.d_model, t_nhead=self.t_nhead, s_nhead=self.s_nhead,
                                    T_dropout_rate=self.T_dropout_rate, S_dropout_rate=self.S_dropout_rate,
                                    gate_input_start_index=self.gate_input_start_index,
-                                   gate_input_end_index=self.gate_input_end_index, beta=self.beta)
+                                   gate_input_end_index=self.gate_input_end_index, beta=self.beta,
+                                   ms_kernels=self.ms_kernels, ms_dilations=self.ms_dilations, ms_dropout=self.ms_dropout)
         super(MASTERModel, self).init_model()
