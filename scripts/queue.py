@@ -16,6 +16,7 @@ p.add_argument('--max_jobs', type=int, default=40)
 p.add_argument('--gpus', default='0,1,2,3,4,5,6,7')
 p.add_argument('--threads', type=int, default=2)
 p.add_argument('--log_dir', default='logs')
+p.add_argument('--global_cap', type=int, default=0, help='max training processes machine-wide (0 = off)')
 args = p.parse_args()
 
 gpus = [int(g) for g in args.gpus.split(',')]
@@ -40,6 +41,20 @@ def gpu_load():
         return {g: 0 for g in gpus}
 
 
+def n_training():
+    """Training processes machine-wide (incl. orphans of earlier queues): python processes running main.py."""
+    n = 0
+    for pid in os.listdir('/proc'):
+        if pid.isdigit():
+            try:
+                cmd = open(f'/proc/{pid}/cmdline', 'rb').read().split(b'\0')
+            except OSError:
+                continue
+            if len(cmd) > 2 and cmd[0].endswith(b'python') and any(c.endswith(b'main.py') for c in cmd) and b'conda' not in cmd[0]:
+                n += 1
+    return n
+
+
 running = {}  # id -> (Popen, gpu, t0)
 failed = []
 while todo or running:
@@ -50,8 +65,10 @@ while todo or running:
             if not ok:
                 failed.append(jid)
             del running[jid]
-    while todo and len(running) < args.max_jobs:
+    while todo and len(running) < args.max_jobs and (not args.global_cap or n_training() < args.global_cap):
         job = todo.pop(0)
+        if os.path.exists(job['done']) or os.path.exists(os.path.join(args.log_dir, f'{job["id"]}.log')):
+            continue  # finished or claimed by another queue
         load = gpu_load()
         for _, g, t0 in running.values():   # just-started jobs may not hold a CUDA context yet
             if time.time() - t0 < 90:

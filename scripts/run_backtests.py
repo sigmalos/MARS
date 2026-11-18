@@ -2,7 +2,7 @@
 
 TopkDropoutStrategy(topk=30, n_drop=30), deal price close, benchmark SH000300 (csi300) / SH000906 (csi800),
 2020-07-01 .. 2022-12-31. Reports excess return without cost (as the official table) and with qlib's default
-cost (open 0.15%, close 0.25%, min 5 CNY): annualised return AR, information ratio IR, max drawdown MDD.
+cost of qlib.contrib.evaluate.backtest_daily (buy 0.05%, sell 0.15%, min 5 CNY; no price-limit check): annualised return AR, information ratio IR, max drawdown MDD.
 Usage: python scripts/run_backtests.py --results results --out analysis_out/backtest.json --procs 16
 """
 import argparse
