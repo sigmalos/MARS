@@ -238,13 +238,15 @@ class SequenceModel():
         self.model.load_state_dict(torch.load(param_path, map_location=self.device, weights_only=True))
         self.fitted = 'Previously trained.'
 
-    def fit(self, dl_train, dl_valid=None, dl_test=None, full_epochs=True, keep_outputs=('pred',)):
+    def fit(self, dl_train, dl_valid=None, dl_test=None, full_epochs=True, keep_outputs=('pred',), patience=None):
         """Train for n_epochs. Two model-selection protocols are recorded from the same trajectory:
           * 'stop': official MASTER criterion - first epoch with train loss <= train_stop_loss_thred
                     (last epoch if never reached). With full_epochs=False training ends there, exactly as the
                     official code; with full_epochs=True training continues, which does not change the
                     trajectory up to that epoch (evaluation consumes no randomness).
-          * 'best': epoch with the best validation `select_metric`.
+          * 'best': epoch with the best validation `select_metric`. With `patience`, training ends once the
+                    official criterion has been reached and the validation metric has not improved for
+                    `patience` epochs (standard early stopping; at most n_epochs).
         dl_test is only *evaluated* (stored for the selected epochs); it never influences training/selection."""
         os.makedirs(self.save_path, exist_ok=True)
         self.history, self.selected = [], {}
@@ -278,6 +280,8 @@ class SequenceModel():
                 self.selected['stop'] = snapshot()
                 if not full_epochs:
                     break
+            if patience is not None and 'stop' in self.selected and step - self.selected['best']['epoch'] >= patience:
+                break
         for name, sel in self.selected.items():
             torch.save(sel['state'], f'{self.save_path}/{self.save_prefix}_{self.seed}_{name}.pkl')
         # leave the model in the official-criterion state

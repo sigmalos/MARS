@@ -28,6 +28,7 @@ parser.add_argument('--n_epoch', type=int, default=40)
 parser.add_argument('--stop_loss', type=float, default=0.95)
 parser.add_argument('--official_stop', action='store_true', help='end training at the official criterion')
 parser.add_argument('--select_metric', default='IC')
+parser.add_argument('--patience', type=int, default=8, help='early stopping for the best-validation protocol (<0: off)')
 parser.add_argument('--relations', default='', help='comma separated subset of ' + ','.join(rel_name for rel_name in
                     ['ind', 'corr', 'fine', 'sw1', 'sw3', 'snap', 'rand']))
 parser.add_argument('--model_kwargs', default='{}', help='extra JSON kwargs for MASTERModel (e.g. joint_unc)')
@@ -80,7 +81,8 @@ for seed in seeds:
               'model_kwargs': model_kwargs, 'n_params': n_params}
     keep = ('pred', 'scale', 'nu', 'rel_alpha')
     if args.mode == 'train':
-        selected = model.fit(dl_train, dl_valid, dl_test, full_epochs=not args.official_stop, keep_outputs=keep)
+        selected = model.fit(dl_train, dl_valid, dl_test, full_epochs=not args.official_stop, keep_outputs=keep,
+                             patience=args.patience if args.patience >= 0 else None)
         record['history'] = model.history
         for name, sel in selected.items():
             record[name] = {'epoch': sel['epoch'], 'test': sel['test'], 'valid': sel['valid']}
