@@ -1,8 +1,9 @@
+import os
+import time
 import numpy as np
 import pandas as pd
 import copy
 
-from torch.utils.data import DataLoader
 from torch.utils.data import Sampler
 import torch
 import torch.optim as optim
@@ -54,8 +55,10 @@ class DailyBatchSamplerRandom(Sampler):
 
 
 class SequenceModel():
-    def __init__(self, n_epochs, lr, GPU=None, seed=None, train_stop_loss_thred=None, save_path = 'model/', save_prefix= ''):
+    def __init__(self, n_epochs, lr, GPU=None, seed=None, train_stop_loss_thred=None, save_path = 'model/', save_prefix= '', drop_extreme_label=True):
         self.n_epochs = n_epochs
+        # True for opensource training data; False for original training data (already processed when dumped).
+        self.drop_extreme_label = drop_extreme_label
         self.lr = lr
         self.device = torch.device(f"cuda:{GPU}" if torch.cuda.is_available() else "cpu")
         self.seed = seed
@@ -87,34 +90,57 @@ class SequenceModel():
         loss = (pred[mask]-label[mask])**2
         return torch.mean(loss)
 
-    def train_epoch(self, data_loader):
+    # ------------------------------------------------------------------
+    # Hooks that improved variants may override.
+    # ------------------------------------------------------------------
+    def _forward(self, feature, inst=None):
+        """Run the network. Returns a dict with at least key 'pred' (N,)."""
+        return {'pred': self.model(feature)}
+
+    def _train_loss(self, out, label):
+        """Returns (loss used for backprop, monitored MSE used by the stop criterion)."""
+        loss = self.loss_fn(out['pred'], label)
+        return loss, loss
+
+    def _extra_metrics(self, outs, labels):
+        """outs/labels: per-day lists (label is cross-sectionally z-scored, NaN kept). Returns dict."""
+        return {}
+
+    def _iter_batches(self, dataset, shuffle):
+        """Yields (data[N,T,F] tensor, instrument codes[N]) for each trading day."""
+        sampler = DailyBatchSamplerRandom(dataset, shuffle)
+        instruments = np.asarray(dataset.get_index().get_level_values('instrument'))
+        for idx in sampler:
+            yield torch.from_numpy(dataset[idx]), instruments[idx]
+
+    def train_epoch(self, dataset):
         self.model.train()
         losses = []
 
-        for data in data_loader:
-            data = torch.squeeze(data, dim=0)
+        for data, inst in self._iter_batches(dataset, shuffle=True):
             '''
             data.shape: (N, T, F)
             N - number of stocks
             T - length of lookback_window, 8
-            F - 158 factors + 63 market information + 1 label           
+            F - 158 factors + 63 market information + 1 label
             '''
             feature = data[:, :, 0:-1].to(self.device)
             label = data[:, -1, -1].to(self.device)
 
-            
             # Additional process on labels
             # If you use original data to train, you won't need the following lines because we already drop extreme when we dumped the data.
             # If you use the opensource data to train, use the following lines to drop extreme labels.
             #########################
-            mask, label = drop_extreme(label)
-            feature = feature[mask, :, :]
-            label = zscore(label) # CSZscoreNorm
+            if self.drop_extreme_label:
+                mask, label = drop_extreme(label)
+                feature = feature[mask, :, :]
+                inst = inst[mask.cpu().numpy()]
+                label = zscore(label) # CSZscoreNorm
             #########################
 
-            pred = self.model(feature.float())
-            loss = self.loss_fn(pred, label)
-            losses.append(loss.item())
+            out = self._forward(feature.float(), inst)
+            loss, monitor = self._train_loss(out, label)
+            losses.append(monitor.item())
 
             self.train_optimizer.zero_grad()
             loss.backward()
@@ -123,90 +149,81 @@ class SequenceModel():
 
         return float(np.mean(losses))
 
-    def test_epoch(self, data_loader):
-        self.model.eval()
-        losses = []
-
-        for data in data_loader:
-            data = torch.squeeze(data, dim=0)
-            feature = data[:, :, 0:-1].to(self.device)
-            label = data[:, -1, -1].to(self.device)
-
-            # Note the difference: 
-            # 1) The qlib.DropnaLabel drop **samples** according to label.
-            # 2) Here we use all samples to compute the inter-stock correlation, but only drop the na labels to compute metrics (loss, etc.).
-            # 3) If you already used qlib.DropnaLabel to process the validation data, this will do nothing.
-            mask, label = drop_na(label)
-            label = zscore(label)
-                        
-            pred = self.model(feature.float())
-            loss = self.loss_fn(pred[mask], label)
-            losses.append(loss.item())
-
-        return float(np.mean(losses))
-    
-    def _init_data_loader(self, data, shuffle=True, drop_last=True):
-        sampler = DailyBatchSamplerRandom(data, shuffle)
-        data_loader = DataLoader(data, sampler=sampler, drop_last=drop_last)
-        return data_loader
-
     def load_param(self, param_path):
         self.model.load_state_dict(torch.load(param_path, map_location=self.device))
         self.fitted = 'Previously trained.'
 
     def fit(self, dl_train, dl_valid=None):
-        train_loader = self._init_data_loader(dl_train, shuffle=True, drop_last=True)
         best_param = None
+        self.history = []
+        os.makedirs(self.save_path, exist_ok=True)
         for step in range(self.n_epochs):
-            train_loss = self.train_epoch(train_loader)
+            t0 = time.time()
+            train_loss = self.train_epoch(dl_train)
             self.fitted = step
+            rec = {'epoch': step, 'train_loss': train_loss, 'time': time.time() - t0}
             if dl_valid:
                 predictions, metrics = self.predict(dl_valid)
-                print("Epoch %d, train_loss %.6f, valid ic %.4f, icir %.3f, rankic %.4f, rankicir %.3f." % (step, train_loss, metrics['IC'],  metrics['ICIR'],  metrics['RIC'],  metrics['RICIR']))
-            else: print("Epoch %d, train_loss %.6f" % (step, train_loss))
-        
+                rec.update({f'valid_{k}': float(v) for k, v in metrics.items()})
+                print("Epoch %d, train_loss %.6f, valid ic %.4f, icir %.3f, rankic %.4f, rankicir %.3f, %.0fs." % (step, train_loss, metrics['IC'],  metrics['ICIR'],  metrics['RIC'],  metrics['RICIR'], rec['time']), flush=True)
+            else: print("Epoch %d, train_loss %.6f" % (step, train_loss), flush=True)
+            self.history.append(rec)
+
             if train_loss <= self.train_stop_loss_thred:
                 best_param = copy.deepcopy(self.model.state_dict())
                 torch.save(best_param, f'{self.save_path}/{self.save_prefix}_{self.seed}.pkl')
                 break
-        
+
 
     def predict(self, dl_test):
-        if self.fitted<0:
+        if not isinstance(self.fitted, str) and self.fitted<0:
             raise ValueError("model is not fitted yet!")
-        else:
-            print('Epoch:', self.fitted)
-
-        test_loader = self._init_data_loader(dl_test, shuffle=False, drop_last=False)
 
         preds = []
         ic = []
         ric = []
+        outs, labels = [], []
 
         self.model.eval()
-        for data in test_loader:
-            data = torch.squeeze(data, dim=0)
+        for data, inst in self._iter_batches(dl_test, shuffle=False):
             feature = data[:, :, 0:-1].to(self.device)
-            label = data[:, -1, -1]
-            
+            label = data[:, -1, -1].numpy()
+
             # nan label will be automatically ignored when compute metrics.
             # zscorenorm will not affect the results of ranking-based metrics.
 
             with torch.no_grad():
-                pred = self.model(feature.float()).detach().cpu().numpy()
+                out = {k: v.detach().cpu().numpy() for k, v in self._forward(feature.float(), inst).items()}
+            pred = out['pred']
             preds.append(pred.ravel())
 
-            daily_ic, daily_ric = calc_ic(pred, label.detach().numpy())
+            daily_ic, daily_ric = calc_ic(pred, label)
             ic.append(daily_ic)
             ric.append(daily_ric)
 
+            # z-score the label cross-sectionally (as during training) for error-based metrics
+            valid = ~np.isnan(label)
+            zl = np.full_like(label, np.nan)
+            if valid.sum() > 1:
+                zl[valid] = (label[valid] - label[valid].mean()) / label[valid].std(ddof=1)
+            outs.append(out)
+            labels.append(zl)
+
         predictions = pd.Series(np.concatenate(preds), index=dl_test.get_index())
+
+        all_pred = np.concatenate([o['pred'].ravel() for o in outs])
+        all_label = np.concatenate(labels)
+        v = ~np.isnan(all_label)
+        err = all_pred[v] - all_label[v]
 
         metrics = {
             'IC': np.mean(ic),
             'ICIR': np.mean(ic)/np.std(ic),
             'RIC': np.mean(ric),
-            'RICIR': np.mean(ric)/np.std(ric)
+            'RICIR': np.mean(ric)/np.std(ric),
+            'MSE': float(np.mean(err ** 2)),
+            'MAE': float(np.mean(np.abs(err))),
         }
+        metrics.update(self._extra_metrics(outs, labels))
 
         return predictions, metrics
