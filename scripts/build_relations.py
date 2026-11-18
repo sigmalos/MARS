@@ -3,7 +3,9 @@
 Point-in-time rule: for a sample on trading day d only information effective on or before d is used.
   csrc       CSRC industry. baostock monthly snapshots; record effective from its `updateDate`.
   csrc_snap  CSRC industry of the 2026-11-18 snapshot, back-filled (pre-experiment graph, look-ahead!).
-  csrc_rand  control: point-in-time CSRC industry of a randomly permuted stock (fixed permutation, seed 123).
+  csrc_rand  control: random industry graph. Every stock gets a fixed random key (seed 123); on each day the
+             multiset of that day's true csrc labels (incl. unknown) is assigned to the stocks in key order. Group
+             sizes / edge counts are identical to csrc every day and memberships are persistent, but random.
   sw1/2/3    Shenwan level 1/2/3 from cninfo change records (old standard, SW2021 from its effective date).
              Days before a stock's first Shenwan record use that first record (only affects early 2008).
   corr10     top-10 Pearson correlation of daily returns over the 60 trading days strictly before d
@@ -107,7 +109,7 @@ col_of = {s: i for i, s in enumerate(all_inst)}
 print('price matrix', ret.shape, 'missing close %.1f%%' % (100 * px.isna().values.mean()), flush=True)
 
 rng = np.random.RandomState(123)
-perm = dict(zip(all_inst, np.array(all_inst)[rng.permutation(len(all_inst))]))
+rand_key = dict(zip(all_inst, rng.permutation(len(all_inst))))
 
 vocab = {k: {} for k in ['csrc', 'csrc_snap', 'csrc_rand', 'sw1', 'sw2', 'sw3']}
 vocab_shared = {'csrc_rand': 'csrc'}  # random graph uses the same label space as csrc
@@ -132,7 +134,6 @@ for (u, split), (inst, dt) in datasets.items():
         rows_s = np.where(inst == s)[0]
         d = dt[rows_s]
         lab['csrc'][rows_s] = csrc_t.lookup(s, d)[0]
-        lab['csrc_rand'][rows_s] = csrc_t.lookup(perm[s], d)[0]
         lab['csrc_snap'][rows_s] = snap_map.get(s, '')
         for lv, key in [('l1', 'sw1'), ('l2', 'sw2'), ('l3', 'sw3')]:
             old, filled = sw_old[lv].lookup(s, d)
@@ -140,7 +141,17 @@ for (u, split), (inst, dt) in datasets.items():
             lab[key][rows_s] = np.where(new != '', new, old)
             if lv == 'l1':
                 sw_backfilled[rows_s] = filled & (new == '')
-    arrays = {k: encode(k, v) for k, v in lab.items()}
+    arrays = {k: encode(k, v) for k, v in lab.items() if k != 'csrc_rand'}
+    days_, starts_ = np.unique(dt, return_index=True)
+    bnd = list(starts_) + [n]
+    rnd = np.empty(n, np.int32)
+    for j in range(len(days_)):
+        a, b = bnd[j], bnd[j + 1]
+        keys = np.array([rand_key[x] for x in inst[a:b]])
+        seg = np.empty(b - a, np.int32)
+        seg[np.argsort(keys, kind='stable')] = np.sort(arrays['csrc'][a:b])
+        rnd[a:b] = seg
+    arrays['csrc_rand'] = rnd
 
     # correlation graph and historical volatility, day by day
     corr10 = np.full((n, args.k), -1, np.int16)

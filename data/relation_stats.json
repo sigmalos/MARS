@@ -1,0 +1,240 @@
+{
+ "stats": {
+  "csi300_train": {
+   "samples": 856246,
+   "days": 2979,
+   "sw_backfilled_frac": 0.04843467881893755,
+   "corr_valid_frac": 0.985792480266831,
+   "corr_nb_same_csrc_frac": 0.2616513978734862,
+   "hv20_valid_frac": 0.9945471278114,
+   "csrc": {
+    "coverage": 0.9999813137813198,
+    "groups_per_day": 68.46324269889224,
+    "neighbours_per_stock": 8.37864113043535
+   },
+   "csrc_snap": {
+    "coverage": 0.9476493904789044,
+    "groups_per_day": 45.88653910708291,
+    "neighbours_per_stock": 9.053768200325747
+   },
+   "csrc_rand": {
+    "coverage": 0.9999813137813198,
+    "groups_per_day": 68.46324269889224,
+    "neighbours_per_stock": 8.37864113043535
+   },
+   "sw1": {
+    "coverage": 0.7407287158129789,
+    "groups_per_day": 30.537092984222895,
+    "neighbours_per_stock": 7.812167042203674
+   },
+   "sw2": {
+    "coverage": 0.7407287158129789,
+    "groups_per_day": 73.99362202081235,
+    "neighbours_per_stock": 4.020542695279513
+   },
+   "sw3": {
+    "coverage": 0.7407287158129789,
+    "groups_per_day": 100.0614300100705,
+    "neighbours_per_stock": 2.9806650341982133
+   }
+  },
+  "csi300_valid": {
+   "samples": 20039,
+   "days": 67,
+   "sw_backfilled_frac": 0.0,
+   "corr_valid_frac": 0.999003809262815,
+   "corr_nb_same_csrc_frac": 0.3715534092291885,
+   "hv20_valid_frac": 0.9994510704126952,
+   "csrc": {
+    "coverage": 1.0,
+    "groups_per_day": 49.95522388059702,
+    "neighbours_per_stock": 12.21863782700379
+   },
+   "csrc_snap": {
+    "coverage": 0.9633215230300913,
+    "groups_per_day": 48.95522388059702,
+    "neighbours_per_stock": 11.096215463724228
+   },
+   "csrc_rand": {
+    "coverage": 1.0,
+    "groups_per_day": 49.95522388059702,
+    "neighbours_per_stock": 12.21863782700379
+   },
+   "sw1": {
+    "coverage": 0.8364189829831828,
+    "groups_per_day": 29.0,
+    "neighbours_per_stock": 11.364384975081943
+   },
+   "sw2": {
+    "coverage": 0.8364189829831828,
+    "groups_per_day": 76.94029850746269,
+    "neighbours_per_stock": 5.969027612269732
+   },
+   "sw3": {
+    "coverage": 0.8364189829831828,
+    "groups_per_day": 107.95522388059702,
+    "neighbours_per_stock": 5.068691160703407
+   }
+  },
+  "csi300_test": {
+   "samples": 185700,
+   "days": 619,
+   "sw_backfilled_frac": 0.0,
+   "corr_valid_frac": 0.9999623047926764,
+   "corr_nb_same_csrc_frac": 0.37260389054882276,
+   "hv20_valid_frac": 0.9994291868605277,
+   "csrc": {
+    "coverage": 1.0,
+    "groups_per_day": 46.61873990306947,
+    "neighbours_per_stock": 14.18037695207324
+   },
+   "csrc_snap": {
+    "coverage": 0.9831233171782445,
+    "groups_per_day": 45.80613893376414,
+    "neighbours_per_stock": 14.161723209477652
+   },
+   "csrc_rand": {
+    "coverage": 1.0,
+    "groups_per_day": 46.61873990306947,
+    "neighbours_per_stock": 14.18037695207324
+   },
+   "sw1": {
+    "coverage": 0.9087237479806138,
+    "groups_per_day": 28.416801292407108,
+    "neighbours_per_stock": 14.226203554119548
+   },
+   "sw2": {
+    "coverage": 0.9087237479806138,
+    "groups_per_day": 77.7108239095315,
+    "neighbours_per_stock": 6.177329025309639
+   },
+   "sw3": {
+    "coverage": 0.9087237479806138,
+    "groups_per_day": 120.41033925686591,
+    "neighbours_per_stock": 4.672202477113624
+   }
+  },
+  "csi800_train": {
+   "samples": 1757732,
+   "days": 2979,
+   "sw_backfilled_frac": 0.04873496073349066,
+   "corr_valid_frac": 0.9821370152455516,
+   "corr_nb_same_csrc_frac": 0.1770721827797638,
+   "hv20_valid_frac": 0.9923634547246111,
+   "csrc": {
+    "coverage": 0.9997934838758127,
+    "groups_per_day": 82.33635448136958,
+    "neighbours_per_stock": 17.65249771061908
+   },
+   "csrc_snap": {
+    "coverage": 0.9343870396624742,
+    "groups_per_day": 61.0785498489426,
+    "neighbours_per_stock": 17.10040016890344
+   },
+   "csrc_rand": {
+    "coverage": 0.9997934838758127,
+    "groups_per_day": 82.33635448136958,
+    "neighbours_per_stock": 17.65249771061908
+   },
+   "sw1": {
+    "coverage": 0.7567877241809332,
+    "groups_per_day": 32.69284994964753,
+    "neighbours_per_stock": 14.189597812239079
+   },
+   "sw2": {
+    "coverage": 0.7567877241809332,
+    "groups_per_day": 92.6139644175898,
+    "neighbours_per_stock": 6.043887309146931
+   },
+   "sw3": {
+    "coverage": 0.7567877241809332,
+    "groups_per_day": 149.3595166163142,
+    "neighbours_per_stock": 3.4129784406099124
+   }
+  },
+  "csi800_valid": {
+   "samples": 53418,
+   "days": 67,
+   "sw_backfilled_frac": 0.0,
+   "corr_valid_frac": 0.999625554549081,
+   "corr_nb_same_csrc_frac": 0.3197708529480742,
+   "hv20_valid_frac": 0.9994196712718559,
+   "csrc": {
+    "coverage": 1.0,
+    "groups_per_day": 66.77611940298507,
+    "neighbours_per_stock": 27.833069272180094
+   },
+   "csrc_snap": {
+    "coverage": 0.9628776816803325,
+    "groups_per_day": 69.77611940298507,
+    "neighbours_per_stock": 26.025906682043853
+   },
+   "csrc_rand": {
+    "coverage": 1.0,
+    "groups_per_day": 66.77611940298507,
+    "neighbours_per_stock": 27.833069272180094
+   },
+   "sw1": {
+    "coverage": 0.8287281440712868,
+    "groups_per_day": 31.0,
+    "neighbours_per_stock": 24.754798844158362
+   },
+   "sw2": {
+    "coverage": 0.8287281440712868,
+    "groups_per_day": 105.8955223880597,
+    "neighbours_per_stock": 10.183884758380657
+   },
+   "sw3": {
+    "coverage": 0.8287281440712868,
+    "groups_per_day": 179.88059701492537,
+    "neighbours_per_stock": 6.481625186900746
+   }
+  },
+  "csi800_test": {
+   "samples": 495121,
+   "days": 619,
+   "sw_backfilled_frac": 0.0,
+   "corr_valid_frac": 0.9997011308562198,
+   "corr_nb_same_csrc_frac": 0.34727762602045886,
+   "hv20_valid_frac": 0.9989255151770982,
+   "csrc": {
+    "coverage": 1.0,
+    "groups_per_day": 67.03715670436188,
+    "neighbours_per_stock": 29.944079306524113
+   },
+   "csrc_snap": {
+    "coverage": 0.9742830540413353,
+    "groups_per_day": 68.61712439418417,
+    "neighbours_per_stock": 29.181345583433252
+   },
+   "csrc_rand": {
+    "coverage": 1.0,
+    "groups_per_day": 67.03715670436188,
+    "neighbours_per_stock": 29.944079306524113
+   },
+   "sw1": {
+    "coverage": 0.895385168473969,
+    "groups_per_day": 30.607431340872374,
+    "neighbours_per_stock": 29.720063907630905
+   },
+   "sw2": {
+    "coverage": 0.895385168473969,
+    "groups_per_day": 113.26332794830371,
+    "neighbours_per_stock": 10.4728423706127
+   },
+   "sw3": {
+    "coverage": 0.895385168473969,
+    "groups_per_day": 212.7156704361874,
+    "neighbours_per_stock": 6.593633267351556
+   }
+  }
+ },
+ "vocab_sizes": {
+  "csrc": 354,
+  "csrc_snap": 79,
+  "csrc_rand": 0,
+  "sw1": 45,
+  "sw2": 202,
+  "sw3": 430
+ }
+}
