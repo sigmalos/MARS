@@ -21,6 +21,8 @@ parser.add_argument('--n_epoch', type=int, default=40)
 parser.add_argument('--model_dir', default='model')
 parser.add_argument('--save_dir', default='model', help='where trained checkpoints are written')
 parser.add_argument('--result_file', default=None, help='optional json file to dump per-seed metrics')
+parser.add_argument('--stop_loss', type=float, default=0.95, help='training-loss stop threshold (0 = run all n_epoch)')
+parser.add_argument('--test_each_epoch', action='store_true', help='record test metrics after every epoch (analysis only)')
 parser.add_argument('--model_kwargs', default='{}', help='extra JSON kwargs forwarded to MASTERModel (variant switches)')
 args = parser.parse_args()
 
@@ -57,7 +59,7 @@ elif universe == 'csi800':
 n_epoch = args.n_epoch
 lr = 1e-5
 GPU = args.gpu
-train_stop_loss_thred = 0.95
+train_stop_loss_thred = args.stop_loss
 # Original training data already went through DropExtreme + CSZScoreNorm on labels when dumped.
 drop_extreme_label = (prefix == 'opensource')
 
@@ -79,7 +81,7 @@ for seed in seeds:
 
     start = time.time()
     if args.mode == 'train':
-        model.fit(dl_train, dl_valid)
+        model.fit(dl_train, dl_valid, dl_test if args.test_each_epoch else None)
         print("Model Trained.", flush=True)
     else:
         param_path = os.path.join(args.model_dir, f'{universe}_{prefix}_{seed}.pkl')

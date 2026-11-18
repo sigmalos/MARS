@@ -153,7 +153,9 @@ class SequenceModel():
         self.model.load_state_dict(torch.load(param_path, map_location=self.device))
         self.fitted = 'Previously trained.'
 
-    def fit(self, dl_train, dl_valid=None):
+    def fit(self, dl_train, dl_valid=None, dl_test=None):
+        """dl_test (optional) is only *evaluated* after every epoch for offline analysis of the
+        training dynamics; it never influences training or stopping."""
         best_param = None
         self.history = []
         os.makedirs(self.save_path, exist_ok=True)
@@ -167,6 +169,9 @@ class SequenceModel():
                 rec.update({f'valid_{k}': float(v) for k, v in metrics.items()})
                 print("Epoch %d, train_loss %.6f, valid ic %.4f, icir %.3f, rankic %.4f, rankicir %.3f, %.0fs." % (step, train_loss, metrics['IC'],  metrics['ICIR'],  metrics['RIC'],  metrics['RICIR'], rec['time']), flush=True)
             else: print("Epoch %d, train_loss %.6f" % (step, train_loss), flush=True)
+            if dl_test is not None:
+                _, tm = self.predict(dl_test)
+                rec.update({f'test_{k}': float(v) for k, v in tm.items()})
             self.history.append(rec)
 
             if train_loss <= self.train_stop_loss_thred:
