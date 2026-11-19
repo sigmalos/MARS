@@ -34,12 +34,23 @@ if phase == 'inner':
                     jobs.append(job(tag, r, kw, lam, uni, 'inner', seed))
 else:
     cfgs = FULL_A if phase == 'fullA' else json.load(open(sys.argv[3]))
+    inner_b = cfgs.pop('_inner', {}) if phase == 'fullB' else {}
+    for uni in ['csi800', 'csi300']:            # inner runs of new combinations first (needed for their rules)
+        for seed in SEEDS_INNER[uni]:
+            for tag, (_, kw, _) in inner_b.items():
+                if uni in kw:
+                    r, kw_u, lam_u = kw[uni]
+                    jobs.append(job(tag, r, kw_u, lam_u, uni, 'inner', seed))
     for seed in range(10):
         for uni in ['csi800', 'csi300']:
             for tag, (r, kw, lam) in cfgs.items():
-                if isinstance(kw, dict) and uni in kw:   # per-universe config (selected on the inner split)
-                    r, kw, lam = kw[uni]
-                jobs.append(job(tag, r, kw, lam, uni, 'full', seed))
+                if phase == 'fullB':                       # per-universe config (selected on the inner split)
+                    if uni not in kw:
+                        continue                           # duplicates an existing run for this universe
+                    r, kw_u, lam_u = kw[uni]
+                    jobs.append(job(tag, r, kw_u, lam_u, uni, 'full', seed))
+                else:
+                    jobs.append(job(tag, r, kw, lam, uni, 'full', seed))
 with open(sys.argv[1], 'w') as f:
     for j in jobs:
         f.write(json.dumps(j) + '\n')

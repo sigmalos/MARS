@@ -79,3 +79,21 @@ def topk_backtest(score, prices, topk=30, weight=None, buy_cost=0.0, sell_cost=0
     m.update({f'abs_{k}': v for k, v in risk(df['port']).items()})
     m['turnover'] = float(df['turnover'].mean())
     return df, m
+
+
+def qlib_backtest(score, universe, start, end, topk=30, n_drop=30, benchmark=None):
+    """Official MASTER/Qlib backtest (TopkDropoutStrategy, close price, qlib backtest_daily default costs
+    buy 0.05% / sell 0.15% / min 5 CNY). score: Series indexed by (datetime, instrument). qlib must be initialised.
+    n_drop < topk is qlib's built-in turnover constraint (at most n_drop holdings are replaced per day)."""
+    from qlib.contrib.strategy import TopkDropoutStrategy
+    from qlib.contrib.evaluate import backtest_daily, risk_analysis
+    strategy = TopkDropoutStrategy(signal=score.sort_index(), topk=topk, n_drop=n_drop)
+    rep, _ = backtest_daily(start_time=start, end_time=end, strategy=strategy, account=100000000,
+                            benchmark=benchmark or BENCHMARK[universe], exchange_kwargs={'deal_price': 'close', 'freq': 'day'})
+    out = {}
+    for key, r in [('nocost', rep['return'] - rep['bench']), ('cost', rep['return'] - rep['bench'] - rep['cost'])]:
+        ra = risk_analysis(r, freq='day')['risk']
+        out.update({f'{key}_AR': float(ra['annualized_return']), f'{key}_IR': float(ra['information_ratio']),
+                    f'{key}_MDD': float(ra['max_drawdown'])})
+    out['turnover'] = float(rep['turnover'].mean())
+    return out
