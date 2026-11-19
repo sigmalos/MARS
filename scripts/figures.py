@@ -12,6 +12,7 @@ import os
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import matplotlib.ticker
 import numpy as np
 
 BLUE, ORANGE, AQUA = '#2a78d6', '#eb6834', '#1baf7a'
@@ -56,6 +57,7 @@ def fig_paired(summary, runs, out, metric='RIC', proto='stop', tags=('ind', 'cor
         ax.set_title(uni.upper())
         ax.set_xlabel(f'Δ{"RankIC" if metric == "RIC" else metric} vs MASTER（同种子配对）')
         ax.grid(axis='y', visible=False)
+        ax.xaxis.set_major_locator(matplotlib.ticker.MaxNLocator(4))
     fig.savefig(out)
     plt.close(fig)
 
@@ -130,6 +132,7 @@ def fig_matched(final, out, metric='RIC', tags=('ind', 'corr', 'fine', 'ind_corr
         ax.set_title(f'{uni.upper()}（第 {r[0]}–{r[1]} 轮平均）')
         ax.set_xlabel(f'Δ{"RankIC" if metric == "RIC" else metric} vs MASTER（同种子、同训练轮数）')
         ax.grid(axis='y', visible=False)
+        ax.xaxis.set_major_locator(matplotlib.ticker.MaxNLocator(4))
     fig.savefig(out)
     plt.close(fig)
 
