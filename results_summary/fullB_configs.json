@@ -1,0 +1,74 @@
+{
+ "ic_wstar": [
+  "",
+  {
+   "csi300": [
+    "ind,dcorr",
+    {
+     "corr_window": 20
+    },
+    0.0
+   ],
+   "csi800": [
+    "ind,dcorr",
+    {
+     "corr_window": 20
+    },
+    0.0
+   ]
+  },
+  0.0
+ ],
+ "final_g": [
+  "",
+  {
+   "csi300": [
+    "ind,dcorr",
+    {
+     "corr_window": 20,
+     "corr_mode": "signed",
+     "corr_edge": "signed"
+    },
+    0.0
+   ],
+   "csi800": [
+    "ind,dcorr",
+    {
+     "corr_window": 20,
+     "ind_edge": "signed",
+     "corr_mode": "signed",
+     "corr_edge": "signed"
+    },
+    0.0
+   ]
+  },
+  0.0
+ ],
+ "_inner": {
+  "final_g": [
+   "",
+   {
+    "csi300": [
+     "ind,dcorr",
+     {
+      "corr_window": 20,
+      "corr_mode": "signed",
+      "corr_edge": "signed"
+     },
+     0.0
+    ],
+    "csi800": [
+     "ind,dcorr",
+     {
+      "corr_window": 20,
+      "ind_edge": "signed",
+      "corr_mode": "signed",
+      "corr_edge": "signed"
+     },
+     0.0
+    ]
+   },
+   0.0
+  ]
+ }
+}
