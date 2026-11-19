@@ -50,7 +50,7 @@ def n_training():
                 cmd = open(f'/proc/{pid}/cmdline', 'rb').read().split(b'\0')
             except OSError:
                 continue
-            if len(cmd) > 2 and cmd[0].endswith(b'python') and any(c.endswith(b'main.py') for c in cmd) and b'conda' not in cmd[0]:
+            if len(cmd) > 2 and cmd[0].endswith(b'python') and any(c.endswith(b'main.py') or c.endswith(b'run_traj.py') for c in cmd) and b'conda' not in cmd[0]:
                 n += 1
     return n
 
