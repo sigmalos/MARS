@@ -58,9 +58,11 @@ class DayBatches:
     The [N, T, F] tensor of a day is gathered with pre-computed index arrays instead of calling
     TSDataSampler.__getitem__ sample by sample; the result is bit-identical (checked in tests) but
     several times faster. Relation arrays attached to the dataset (see relations.py) are sliced per day.
+    `date_range` = (first, last) (inclusive, strings or None) restricts the batches to a contiguous range of days;
+    outputs of `evaluate` are then indexed compactly over the selected samples (`index()`).
     """
 
-    def __init__(self, ds):
+    def __init__(self, ds, date_range=None):
         fillna_type = getattr(ds, 'fillna_type', 'none')
         assert fillna_type in ('none', 'ffill', 'ffill+bfill')
         index = ds.get_index()
@@ -69,9 +71,19 @@ class DayBatches:
         dates = index.get_level_values('datetime')
         assert (np.diff(dates.values.astype('int64')) >= 0).all(), 'index must be sorted by datetime'
         counts = pd.Series(index=index, dtype=float).groupby('datetime').size()
-        self.day_dates = counts.index
-        self.counts = counts.values
-        self.starts = np.r_[0, np.cumsum(self.counts)[:-1]]
+        starts = np.r_[0, np.cumsum(counts.values)[:-1]]
+        sel = np.ones(len(counts), bool)
+        if date_range is not None:
+            lo, hi = date_range
+            if lo is not None:
+                sel &= counts.index >= pd.Timestamp(lo)
+            if hi is not None:
+                sel &= counts.index <= pd.Timestamp(hi)
+        self.day_dates = counts.index[sel]
+        self.counts = counts.values[sel]
+        self.starts = starts[sel]                       # global row of the first sample of each selected day
+        self.out_starts = np.r_[0, np.cumsum(self.counts)[:-1]]   # compact row in evaluate() outputs
+        self.n = int(self.counts.sum())
         rc = np.asarray(ds.idx_map)
         if rc.dtype == object:
             rc = np.array([tuple(x) for x in rc])
@@ -85,9 +97,16 @@ class DayBatches:
             ind = _ffill_rows(_ffill_rows(ind)[:, ::-1])[:, ::-1]
         self.sample_idx = np.nan_to_num(ind, nan=ds.nan_idx).astype(np.int64)  # [n_samples, T]
         self.relations = getattr(ds, 'relation_arrays', {})
+        self.ret_matrix = getattr(ds, 'ret_matrix', None)
 
     def __len__(self):
         return len(self.counts)
+
+    def rows(self):
+        return np.concatenate([np.arange(s, s + n) for s, n in zip(self.starts, self.counts)])
+
+    def index(self):
+        return self.ds.get_index()[self.rows()]
 
     def order(self, shuffle):
         index = np.arange(len(self.counts))
@@ -100,12 +119,12 @@ class DayBatches:
         data = self.ds.data_arr[self.sample_idx[s:s + n]]  # [N, T, F]
         rel = {name: arr[s:s + n] for name, arr in self.relations.items()}
         return torch.from_numpy(data), {'inst': self.instruments[s:s + n], 'date': self.day_dates[k], 'rel': rel,
-                                        'slice': (s, n)}
+                                        'slice': (self.out_starts[k], n), 'ret': self.ret_matrix}
 
 
 class SequenceModel():
     def __init__(self, n_epochs, lr, GPU=None, seed=None, train_stop_loss_thred=None, save_path='model/', save_prefix='',
-                 drop_extreme_label=True, select_metric='IC'):
+                 drop_extreme_label=True, select_metric='IC', turnover_lambda=0.0):
         self.n_epochs = n_epochs
         self.lr = lr
         self.device = torch.device(f"cuda:{GPU}" if torch.cuda.is_available() else "cpu")
@@ -114,6 +133,9 @@ class SequenceModel():
         # True for opensource training data; False for original training data (already processed when dumped).
         self.drop_extreme_label = drop_extreme_label
         self.select_metric = select_metric
+        # training-time turnover penalty: lambda * mean((z(pred_t) - z(pred_{t-1}))^2) over stocks present on both days,
+        # pred_{t-1} from an eval-mode forward without gradient (target), z = cross-sectional z-score
+        self.turnover_lambda = turnover_lambda
 
         if self.seed is not None:
             np.random.seed(self.seed)
@@ -154,17 +176,33 @@ class SequenceModel():
         loss = self.loss_fn(out['pred'], label)
         return loss, loss
 
-    def batches(self, dataset):
-        key = id(dataset)
+    def batches(self, dataset, date_range=None):
+        key = (id(dataset), date_range)
         if key not in self._batch_cache:
-            self._batch_cache[key] = DayBatches(dataset)
+            self._batch_cache[key] = DayBatches(dataset, date_range)
         return self._batch_cache[key]
 
     # ------------------------------------------------------------------
-    def train_epoch(self, dataset):
+    def _turnover_penalty(self, db, k, info, keep, pred):
+        pdata, pinfo = db.get(k - 1)
+        self.model.eval()
+        with torch.no_grad():
+            prev = self._forward(pdata[:, :, 0:-1].to(self.device).float(), pinfo, None)['pred']
         self.model.train()
-        losses = []
-        db = self.batches(dataset)
+        inst = info['inst'] if keep is None else info['inst'][keep.cpu().numpy()]
+        _, ia, ib = np.intersect1d(inst, pinfo['inst'], assume_unique=True, return_indices=True)
+        if len(ia) < 10:
+            return None
+        p = pred[torch.from_numpy(ia).to(self.device)]
+        q = prev[torch.from_numpy(ib).to(self.device)]
+        p = (p - p.mean()) / (p.std() + 1e-8)
+        q = (q - q.mean()) / (q.std() + 1e-8)
+        return ((p - q) ** 2).mean()
+
+    def train_epoch(self, dataset, date_range=None):
+        self.model.train()
+        losses, to_losses = [], []
+        db = self.batches(dataset, date_range)
         for k in db.order(shuffle=True):
             data, info = db.get(k)
             '''
@@ -186,19 +224,26 @@ class SequenceModel():
             out = self._forward(feature.float(), info, keep)
             loss, monitor = self._train_loss(out, label)
             losses.append(monitor.item())
+            if self.turnover_lambda > 0 and k > 0:
+                to = self._turnover_penalty(db, k, info, keep, out['pred'])
+                if to is not None:
+                    loss = loss + self.turnover_lambda * to
+                    to_losses.append(to.item())
 
             self.train_optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_value_(self.model.parameters(), 3.0)
             self.train_optimizer.step()
 
+        self.last_turnover_loss = float(np.mean(to_losses)) if to_losses else float('nan')
         return float(np.mean(losses))
 
-    def evaluate(self, dataset, return_repr=False):
+    def evaluate(self, dataset, return_repr=False, date_range=None):
         """Predict every sample of `dataset` (all stocks, NaN labels only ignored in the metrics).
-        Returns (metrics, outputs) where outputs maps name -> array aligned with dataset.get_index()."""
-        db = self.batches(dataset)
-        n = len(db.instruments)
+        Returns (metrics, outputs) where outputs maps name -> array aligned with dataset.get_index()
+        (or with DayBatches(dataset, date_range).index() if a date range is given)."""
+        db = self.batches(dataset, date_range)
+        n = db.n
         outputs, labels = {}, np.full(n, np.nan, dtype=np.float32)
         ic, ric = [], []
         self.model.eval()
@@ -220,6 +265,7 @@ class SequenceModel():
                 ic.append(a)
                 ric.append(b)
         ic, ric = np.array(ic), np.array(ric)
+        self.last_daily_ic = ic
         v = ~np.isnan(labels)
         err = outputs['pred'][v] - labels[v]
         metrics = {
@@ -288,3 +334,26 @@ class SequenceModel():
         self.model.load_state_dict(self.selected['stop']['state'])
         self.fitted = self.selected['stop']['epoch']
         return self.selected
+
+    def fit_trajectory(self, train, evals, epochs):
+        """Train for exactly `epochs` epochs (no stopping) and record, after every epoch, the train loss, the
+        turnover penalty and metrics + float16 predictions on every evaluation set. All stopping / selection rules
+        are applied offline to this trajectory. train = (dataset, date_range); evals = {name: (dataset, date_range)}."""
+        self.history, self.eval_labels = [], {}
+        preds = {name: [] for name in evals}
+        for step in range(epochs):
+            t0 = time.time()
+            train_loss = self.train_epoch(*train)
+            self.fitted = step
+            rec = {'epoch': step, 'train_loss': train_loss, 'turnover_loss': self.last_turnover_loss}
+            for name, (ds, rng) in evals.items():
+                m, out = self.evaluate(ds, date_range=rng)
+                rec.update({f'{name}_{k}': v for k, v in m.items()})
+                preds[name].append(out['pred'].astype(np.float16))
+                if step == 0:
+                    self.eval_labels[name] = out['label_z']
+            rec['time'] = time.time() - t0
+            self.history.append(rec)
+            print('Epoch %d, train_loss %.6f, to %.4f | ' % (step, train_loss, self.last_turnover_loss) + ', '.join(
+                '%s ic %.4f ric %.4f' % (n, rec[f'{n}_IC'], rec[f'{n}_RIC']) for n in evals) + ', %.0fs' % rec['time'], flush=True)
+        return self.history, {k: np.stack(v) for k, v in preds.items()}

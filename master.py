@@ -172,9 +172,15 @@ class TemporalAttention(nn.Module):
 
 
 class GraphAttention(nn.Module):
-    """Direction C: dense multi-head GAT (Velickovic et al.) over a stock relation graph, applied at every
-    time step. adj[i, j] = True means stock j is a neighbour of stock i (self-loops included)."""
-    def __init__(self, d_model, nhead, dropout):
+    """Dense multi-head GAT (Velickovic et al.) over a stock relation graph, applied at every time step.
+    adj[i, j] = True means stock j is a neighbour of stock i (self-loops included).
+
+    edge = 'none'   : unweighted (pre-experiment / formal-experiment model)
+           'weight' : attention logit bias  e_ij += b_h * w_ij        (w = correlation of the edge, 0 on self-loops)
+           'signed' : e_ij += b_h * |w_ij| + c_h * [w_ij < 0]  and sign-specific value projection: messages of
+                      negatively correlated neighbours use W_neg (hedging relation), positive ones W.
+    New parameters are zero (b, c) or a copy of W (W_neg), so every edge mode equals the unweighted GAT at init."""
+    def __init__(self, d_model, nhead, dropout, edge='none'):
         super().__init__()
         self.nhead = nhead
         self.dh = d_model // nhead
@@ -187,16 +193,36 @@ class GraphAttention(nn.Module):
         self.leaky = nn.LeakyReLU(0.2)
         self.attn_dropout = Dropout(dropout)
         self.out = nn.Linear(self.dh * nhead, d_model)
+        assert edge in ('none', 'weight', 'signed')
+        self.edge = edge
+        if edge != 'none':
+            self.edge_bias = nn.Parameter(torch.zeros(nhead))
+        if edge == 'signed':
+            self.neg_bias = nn.Parameter(torch.zeros(nhead))
+            with torch.random.fork_rng(devices=[]):   # do not consume the global RNG: later modules keep their init
+                self.W_neg = nn.Linear(d_model, self.dh * nhead, bias=False)
+            with torch.no_grad():
+                self.W_neg.weight.copy_(self.W.weight)
 
-    def forward(self, x, adj):  # x: [N, T, D], adj: [N, N] bool
+    def forward(self, x, adj, w=None):  # x: [N, T, D], adj: [N, N] bool, w: [N, N] edge correlation (0 = none)
         N, T, _ = x.shape
-        h = self.W(self.norm(x)).view(N, T, self.nhead, self.dh).permute(1, 2, 0, 3)  # [T, H, N, dh]
+        xn = self.norm(x)
+        h = self.W(xn).view(N, T, self.nhead, self.dh).permute(1, 2, 0, 3)            # [T, H, N, dh]
         e_src = (h * self.a_src[None, :, None, :]).sum(-1)                            # [T, H, N]
         e_dst = (h * self.a_dst[None, :, None, :]).sum(-1)
         e = self.leaky(e_src.unsqueeze(-1) + e_dst.unsqueeze(-2))                     # [T, H, N, N]
+        if self.edge == 'weight':
+            e = e + self.edge_bias.view(1, -1, 1, 1) * w
+        elif self.edge == 'signed':
+            neg = (w < 0).float()
+            e = e + self.edge_bias.view(1, -1, 1, 1) * w.abs() + self.neg_bias.view(1, -1, 1, 1) * neg
         e = e.masked_fill(~adj, float('-inf'))
         att = self.attn_dropout(torch.softmax(e, dim=-1))
-        out = torch.matmul(att, h)                                                    # [T, H, N, dh]
+        if self.edge == 'signed':
+            hn = self.W_neg(xn).view(N, T, self.nhead, self.dh).permute(1, 2, 0, 3)
+            out = torch.matmul(att * (1 - neg), h) + torch.matmul(att * neg, hn)
+        else:
+            out = torch.matmul(att, h)                                                # [T, H, N, dh]
         out = out.permute(2, 0, 1, 3).reshape(N, T, -1)
         return torch.nn.functional.elu(self.out(out))
 
@@ -230,14 +256,16 @@ class RelationAttention(nn.Module):
 
 class MultiRelationGAT(nn.Module):
     """One GAT per relation graph (own parameters), fused by relation-level attention."""
-    def __init__(self, relations, d_model, nhead, dropout, rel_hidden=64):
+    def __init__(self, relations, d_model, nhead, dropout, rel_hidden=64, edge_modes=None):
         super().__init__()
         self.relations = list(relations)
-        self.gats = nn.ModuleDict({r: GraphAttention(d_model, nhead, dropout) for r in self.relations})
+        edge_modes = edge_modes or {}
+        self.gats = nn.ModuleDict({r: GraphAttention(d_model, nhead, dropout, edge_modes.get(r, 'none')) for r in self.relations})
         self.rel_attn = RelationAttention(d_model, rel_hidden) if len(self.relations) > 1 else None
 
-    def forward(self, h, adjs):
-        hs = [self.gats[r](h, adjs[r]) for r in self.relations]
+    def forward(self, h, adjs, weights=None):
+        weights = weights or {}
+        hs = [self.gats[r](h, adjs[r], weights.get(r)) for r in self.relations]
         if self.rel_attn is None:
             return hs[0], None
         return self.rel_attn(hs)
@@ -247,6 +275,7 @@ class MultiRelationGAT(nn.Module):
 RELATIONS = {
     'ind':  ('cat', 'csrc'),       # CSRC industry, point-in-time (baostock monthly snapshots)
     'corr': ('knn', 'corr10'),     # top-10 Pearson correlation of the previous 60 daily returns
+    'dcorr': ('dyn', None),        # correlation graph computed on the fly (window / sign mode: graph_cfg)
     'fine': ('cat', 'sw2'),        # Shenwan level-2, point-in-time (cninfo change history)
     'sw1':  ('cat', 'sw1'),        # Shenwan level-1 (granularity study)
     'sw3':  ('cat', 'sw3'),        # Shenwan level-3 (granularity study)
@@ -258,7 +287,7 @@ CANONICAL_ORDER = list(RELATIONS)
 
 class MASTER(nn.Module):
     def __init__(self, d_feat, d_model, t_nhead, s_nhead, T_dropout_rate, S_dropout_rate, gate_input_start_index, gate_input_end_index, beta,
-                 relations=(), gat_nhead=2, gat_dropout=0.1, rel_hidden=64, joint_unc=None, unc_hidden=64):
+                 relations=(), gat_nhead=2, gat_dropout=0.1, rel_hidden=64, joint_unc=None, unc_hidden=64, edge_modes=None):
         super(MASTER, self).__init__()
         # market
         self.gate_input_start_index = gate_input_start_index
@@ -281,14 +310,14 @@ class MASTER(nn.Module):
         # new modules are created after the original layers -> identical init of shared parameters per seed
         self.relations = [r for r in CANONICAL_ORDER if r in relations]
         if self.relations:
-            self.graph = MultiRelationGAT(self.relations, d_model, gat_nhead, gat_dropout, rel_hidden)
+            self.graph = MultiRelationGAT(self.relations, d_model, gat_nhead, gat_dropout, rel_hidden, edge_modes)
             self.gat_fusion = GatedFusion(d_model)
         self.unc_head = None
         if joint_unc:
             from uncertainty import ScaleHead
             self.unc_head = ScaleHead(d_model, unc_hidden, dist=joint_unc)
 
-    def forward(self, x, adjs=None, return_repr=False):
+    def forward(self, x, adjs=None, return_repr=False, weights=None):
         src = x[:, :, :self.gate_input_start_index] # N, T, D
         gate_input = x[:, -1, self.gate_input_start_index:self.gate_input_end_index]
         src = src * torch.unsqueeze(self.feature_gate(gate_input), dim=1)
@@ -297,7 +326,7 @@ class MASTER(nn.Module):
         s = self.layers[3](h)                                      # inter-stock S-Attention
         out = {}
         if self.relations and adjs is not None:
-            g, alpha = self.graph(h, adjs)                         # multi-relation GAT on the same input
+            g, alpha = self.graph(h, adjs, weights)                # multi-relation GAT on the same input
             s = self.gat_fusion(s, g)                              # H_SA + gamma * H_graph
             if alpha is not None:
                 out['rel_alpha'] = alpha.mean(dim=1)               # [N, R], averaged over time steps
@@ -314,9 +343,21 @@ class MASTERModel(SequenceModel):
     def __init__(
             self, d_feat, d_model, t_nhead, s_nhead, gate_input_start_index, gate_input_end_index,
             T_dropout_rate, S_dropout_rate, beta, relations=(), gat_nhead=2, gat_dropout=0.1, rel_hidden=64,
-            joint_unc=None, unc_hidden=64, **kwargs,
+            joint_unc=None, unc_hidden=64, corr_window=60, corr_mode='pos', corr_k=10, corr_kneg=5, corr_edge='none',
+            ind_edge='none', edge_window=None, **kwargs,
     ):
         super(MASTERModel, self).__init__(**kwargs)
+        # dynamic graph configuration (relation 'dcorr' and edge-weighted 'ind'):
+        #   corr_window : look-back window W of the correlation graph (returns strictly before day t)
+        #   corr_mode   : 'pos'    top-k raw correlation (as the stored 60-day graph)
+        #                 'signed' top-k most positive + top-k_neg most negative market-residual correlation
+        #   corr_edge   : GAT edge mode of 'dcorr' ('none' / 'weight' / 'signed')
+        #   ind_edge    : GAT edge mode of 'ind'; edge weight = market-residual correlation over edge_window
+        self.corr_window, self.corr_mode, self.corr_k, self.corr_kneg = corr_window, corr_mode, corr_k, corr_kneg
+        self.corr_edge, self.ind_edge = corr_edge, ind_edge
+        self.edge_window = edge_window or corr_window
+        assert corr_mode in ('pos', 'signed') and not (corr_mode == 'signed' and corr_edge != 'signed')
+        self._ret_gpu = None
         self.d_model = d_model
         self.d_feat = d_feat
 
@@ -342,33 +383,104 @@ class MASTERModel(SequenceModel):
                                    gate_input_start_index=self.gate_input_start_index,
                                    gate_input_end_index=self.gate_input_end_index, beta=self.beta,
                                    relations=self.relations, gat_nhead=self.gat_nhead, gat_dropout=self.gat_dropout,
-                                   rel_hidden=self.rel_hidden, joint_unc=self.joint_unc, unc_hidden=self.unc_hidden)
+                                   rel_hidden=self.rel_hidden, joint_unc=self.joint_unc, unc_hidden=self.unc_hidden,
+                                   edge_modes={'dcorr': self.corr_edge, 'ind': self.ind_edge})
         super(MASTERModel, self).init_model()
 
+    def day_corr(self, info, W, demean):
+        """Pearson correlation of the day's stocks over the W returns strictly before day t ([n, n], NaN = invalid).
+        Same estimator as scripts/build_relations.py: per-stock mean / std over its valid returns, missing -> 0
+        after centring, >= ceil(2W/3) valid returns required. demean: subtract the equal-weighted cross-sectional
+        mean return of the day's universe first (market-residual correlation)."""
+        if self._ret_gpu is None:
+            self._ret_gpu = torch.from_numpy(info['ret']).to(self.device)
+        ci = info['rel']['cal_idx']
+        assert ci[0] == ci[-1], 'one trading day per batch'
+        cols = torch.from_numpy(info['rel']['inst_idx'].astype(np.int64)).to(self.device)
+        X = self._ret_gpu[int(ci[0]) - W:int(ci[0])][:, cols].double()          # [W, n]
+        m = ~torch.isnan(X)
+        if demean:
+            rm = torch.where(m, X, torch.zeros_like(X)).sum(1) / m.sum(1).clamp(min=1)
+            X = X - rm[:, None]
+        cnt = m.sum(0)
+        mean = torch.where(m, X, torch.zeros_like(X)).sum(0) / cnt.clamp(min=1)
+        Xc = torch.where(m, X - mean, torch.zeros_like(X))
+        sd = torch.sqrt((Xc ** 2).sum(0) / (cnt - 1).clamp(min=1))
+        valid = (cnt >= int(np.ceil(2 * W / 3))) & (sd > 0)
+        Z = torch.where(valid[None, :], Xc / torch.where(sd > 0, sd, torch.ones_like(sd)), torch.zeros_like(Xc))
+        C = (Z.T @ Z / (W - 1)).float()
+        C[~valid, :] = float('nan')
+        C[:, ~valid] = float('nan')
+        C.fill_diagonal_(float('nan'))
+        return C
+
+    @staticmethod
+    def _knn(C, k, largest):
+        """adjacency [n, n]: row i -> its k largest (or smallest) finite entries."""
+        n = C.shape[0]
+        fill = float('-inf') if largest else float('inf')
+        Cm = torch.where(torch.isfinite(C), C, torch.full_like(C, fill))
+        nvalid = torch.isfinite(C).any(1)
+        kk = min(k, int(nvalid.sum()) - 1)
+        adj = torch.zeros(n, n, dtype=torch.bool, device=C.device)
+        if kk > 0:
+            top = torch.topk(Cm, kk, dim=1, largest=largest).indices
+            rows = torch.arange(n, device=C.device)[:, None].expand(-1, kk)
+            ok = nvalid[:, None] & torch.isfinite(torch.gather(C, 1, top))
+            adj[rows[ok], top[ok]] = True
+        return adj
+
     def build_adjs(self, info, keep=None):
-        adjs = {}
+        adjs, weights = {}, {}
         n = len(info['inst'])
         eye = torch.eye(n, dtype=torch.bool, device=self.device)
+        cache = {}
+
+        def corr(W, demean):
+            if (W, demean) not in cache:
+                cache[(W, demean)] = self.day_corr(info, W, demean)
+            return cache[(W, demean)]
+
         for r in self.relations:
             kind, key = RELATIONS[r]
-            arr = torch.from_numpy(np.ascontiguousarray(info['rel'][key])).to(self.device)
+            w = None
             if kind == 'cat':
+                arr = torch.from_numpy(np.ascontiguousarray(info['rel'][key])).to(self.device)
                 adj = (arr[:, None] == arr[None, :]) & (arr[:, None] >= 0)
-            else:  # knn: arr[i] = positions (within the day) of the neighbours of stock i, -1 = none
+                if r == 'ind' and self.ind_edge != 'none':
+                    w = torch.nan_to_num(corr(self.edge_window, True), nan=0.0)
+            elif kind == 'knn':  # arr[i] = positions (within the day) of the neighbours of stock i, -1 = none
+                arr = torch.from_numpy(np.ascontiguousarray(info['rel'][key])).to(self.device)
                 adj = torch.zeros(n, n, dtype=torch.bool, device=self.device)
                 rows = torch.arange(n, device=self.device).repeat_interleave(arr.shape[1])
                 cols = arr.reshape(-1).long()
                 ok = cols >= 0
                 adj[rows[ok], cols[ok]] = True
+            else:  # 'dyn': correlation graph computed on the fly
+                if self.corr_mode == 'pos':
+                    C = corr(self.corr_window, False)
+                    adj = self._knn(C, self.corr_k, largest=True)
+                else:
+                    C = corr(self.corr_window, True)
+                    adj = self._knn(C, self.corr_k, largest=True) | self._knn(C, self.corr_kneg, largest=False)
+                if self.corr_edge != 'none':
+                    w = torch.nan_to_num(C, nan=0.0)
             adj = adj | eye
+            if w is not None:
+                w = torch.where(adj & ~eye, w, torch.zeros_like(w))
             if keep is not None:
                 adj = adj[keep][:, keep]
+                w = w[keep][:, keep] if w is not None else None
             adjs[r] = adj
-        return adjs
+            if w is not None:
+                weights[r] = w
+        return adjs, weights
 
     def _forward(self, feature, info, keep=None, return_repr=False):
-        adjs = self.build_adjs(info, keep) if self.relations else None
-        return self.model(feature, adjs, return_repr=return_repr)
+        if not self.relations:
+            return self.model(feature, None, return_repr=return_repr)
+        adjs, weights = self.build_adjs(info, keep)
+        return self.model(feature, adjs, return_repr=return_repr, weights=weights)
 
     def _train_loss(self, out, label):
         mse = self.loss_fn(out['pred'], label)

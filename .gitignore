@@ -1,6 +1,6 @@
-__pycache__/
-logs/
-results/
-checkpoints/
-results_stage2/
 analysis_out/
+checkpoints/
+logs/
+__pycache__/
+results/
+results_stage2/
