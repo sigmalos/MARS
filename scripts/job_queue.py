@@ -2,7 +2,7 @@
 
 jobs file: JSON lines {"id", "cmd" (list), "done" (file that exists when finished)}; jobs whose `done` file exists
 are skipped. Each job gets CUDA_VISIBLE_DEVICES of the GPU with the fewest running jobs.
-Usage: python scripts/queue.py jobs.jsonl --max_jobs 40 --gpus 0,1,2,3,4,5,6,7 --threads 2 --log_dir logs
+Usage: python scripts/job_queue.py jobs.jsonl --max_jobs 40 --gpus 0,1,2,3,4,5,6,7 --threads 2 --log_dir logs
 """
 import argparse
 import json
