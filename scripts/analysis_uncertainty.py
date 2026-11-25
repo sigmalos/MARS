@@ -19,7 +19,7 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-from uncertainty import prob_metrics, std_of  # noqa: E402
+from mars.uncertainty import prob_metrics, std_of  # noqa: E402
 
 p = argparse.ArgumentParser()
 p.add_argument('--results', default='results')
@@ -54,7 +54,7 @@ _prices = {}
 
 
 def bt_one(task):
-    import backtest as bt
+    from mars import backtest as bt
     uni, seed = task
     if uni not in _prices:
         import logging

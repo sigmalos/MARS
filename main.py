@@ -13,8 +13,8 @@ import time
 
 import numpy as np
 
-from master import MASTERModel
-import relations as rel
+from mars.master import MASTERModel
+from mars import relations as rel
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--universe', default='csi300', choices=['csi300', 'csi800'])

@@ -111,7 +111,7 @@ def init():
 
 
 def bt(task):
-    import backtest
+    from mars import backtest
     uni, tag, seed, nd = task
     return task, backtest.qlib_backtest(predictions_for(uni, tag, seed), uni, IVAL[0], IVAL[1], n_drop=nd)
 

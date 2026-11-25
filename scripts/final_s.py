@@ -75,7 +75,7 @@ def init():
 
 
 def bt(task):
-    import backtest
+    from mars import backtest
     uni, tag, s, rule, nd = task
     r = runs[(uni, tag)][s]
     inst, dt, y = T.index(args.results, uni, 'test')

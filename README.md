@@ -7,7 +7,7 @@ MARS 是在 [MASTER](https://github.com/SJTU-DMTai/MASTER)（AAAI 2024，*Market
 - 每种关系使用独立的 GAT，经**关系级注意力**融合后，与 S-Attention 的输出**门控相加**。新增模块均零初始化，因此训练初期与 MASTER 等价；
 - 可选的**解耦式（两阶段）Student-t 预测不确定性**：冻结均值网络，只训练尺度头，因此不改变排序。
 
-本仓库 fork 自 [SJTU-DMTai/MASTER](https://github.com/SJTU-DMTai/MASTER)，`model/`、`qlib-update/` 与 `MASTER-*.pdf` 均为原仓库内容。
+本仓库 fork 自 [SJTU-DMTai/MASTER](https://github.com/SJTU-DMTai/MASTER)，`qlib-update/` 为原仓库内容。
 
 ## 主要结果
 
@@ -31,23 +31,33 @@ MARS 是在 [MASTER](https://github.com/SJTU-DMTai/MASTER)（AAAI 2024，*Market
 
 | 路径 | 内容 |
 | --- | --- |
-| `master.py` | MARS 模型：多关系 GAT（边模式 none / weight / signed）、关系注意力、门控融合、动态相关图、可选联合尺度头 |
-| `base_model.py` | 训练与评估：按日向量化取数、官方停止准则与验证集选模、换手惩罚、固定轮数轨迹训练 |
+| `mars/master.py` | MARS 模型：多关系 GAT（边模式 none / weight / signed）、关系注意力、门控融合、动态相关图、可选联合尺度头 |
+| `mars/base_model.py` | 训练与评估：按日向量化取数、官方停止准则与验证集选模、换手惩罚、固定轮数轨迹训练 |
+| `mars/relations.py` | 把预计算的关系数组与收益矩阵挂到 Qlib `TSDataSampler` 上 |
+| `mars/uncertainty.py` | 尺度头、高斯 / Student-t 似然、概率指标 |
+| `mars/backtest.py` | Qlib 官方回测封装（TopkDropout），以及向量化 top-k 回测 |
 | `main.py` | 训练 / 评估入口，同时记录官方准则（stop）与验证集最优（best）两种协议 |
 | `run_traj.py` | 固定轮数训练并保存每轮预测，支持内部验证切分（`--protocol inner`） |
-| `relations.py` | 把预计算的关系数组与收益矩阵挂到 Qlib `TSDataSampler` 上 |
-| `uncertainty.py`、`stage2_uncertainty.py` | 尺度头、高斯 / Student-t 似然、概率指标；两阶段不确定性训练 |
-| `backtest.py` | Qlib 官方回测封装（TopkDropout），以及向量化 top-k 回测 |
+| `stage2_uncertainty.py` | 两阶段不确定性训练（冻结均值网络，只训练尺度头） |
 | `scripts/fetch_industry.py` | 下载按时点的证监会行业（baostock）与行业变更记录（巨潮资讯） |
 | `scripts/build_relations.py`、`scripts/build_returns.py` | 构建逐样本的关系数组，以及全局日收益矩阵 |
 | `scripts/` 其余文件 | 批量任务（`make_jobs*.py`、`job_queue.py`）、选择与统计（`select_inner.py`、`aggregate.py`、`final_*.py`）、回测与作图 |
-| `data/` | 市场信息表，以及处理后的按时点行业表 `csrc_pit.csv` / `sw_pit.csv` 和关系统计 |
+| `results_summary/` | 汇总后的实验结果（JSON） |
+| `data/`、`model/` | **不纳入版本控制**：数据表与模型文件，获取方式见下文“数据准备” |
 
 ## 环境
 
 Python 3.11、PyTorch 2.5、pandas 2.3、numpy 2.x、pyqlib 0.9.7、scipy、matplotlib。下载行业数据另需 `baostock` 与 `cryptography`。
 
 ## 数据准备
+
+仓库运行时需要两个本地目录：`data/` 与 `model/`。它们不在版本控制中，可以是普通目录，也可以是指向数据盘的软链接。
+
+- `data/`：
+  - `csi_market_information.csv` 取自 MASTER 原仓库的 `data/`；
+  - `csrc_pit.csv`、`sw_pit.csv`、`relation_stats.json` 由下面第 3 步的 `build_relations.py --data_out data` 生成；
+  - `stock_industry.csv` 由 `fetch_industry.py snapshot` 生成。
+- `model/`：MASTER 官方 checkpoint（`csi{300,800}_{original,opensource}_0.pkl`）与 `performance.xlsx`，取自 MASTER 原仓库的 `model/`，仅用于复现官方结果。
 
 1. **MASTER 数据**：从 MASTER 原 README 中的链接下载 opensource 版本数据，例如放到 `/data/dataset/MASTER/opensource/{csi300,csi800}_dl_{train,valid,test}.pkl`。
 2. **Qlib 行情**：下载 [chenditc/investment_data](https://github.com/chenditc/investment_data/releases) 发布的 `qlib_bin.tar.gz` 并解压，用于计算相关图、历史波动率和回测。
@@ -77,7 +87,7 @@ python run_traj.py --universe csi300 --seed 0 --protocol full --relations ind,dc
 python stage2_uncertainty.py --universe csi300 --seed 0 --stage1_tag multi --relations ind,corr,fine
 
 # Qlib 回测：run_backtests.py 为官方设定（top-30，n_drop=30）；
-# 换手约束回测用 backtest.qlib_backtest(score, universe, start, end, n_drop=3)，见 scripts/final_s.py
+# 换手约束回测用 mars.backtest.qlib_backtest(score, universe, start, end, n_drop=3)，见 scripts/final_s.py
 python scripts/run_backtests.py --results results --out analysis_out/backtest.json
 ```
 

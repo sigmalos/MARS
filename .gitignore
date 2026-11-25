@@ -7,3 +7,6 @@ results_stage2/
 analysis_out/
 checkpoints/
 __pycache__/
+# data / model files live on /data (symlinks on this machine only, see AGENTS.md)
+/data
+/model

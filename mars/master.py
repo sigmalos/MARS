@@ -6,7 +6,7 @@ from torch.nn.modules.normalization import LayerNorm
 import math
 import numpy as np
 
-from base_model import SequenceModel
+from .base_model import SequenceModel
 
 
 class PositionalEncoding(nn.Module):
@@ -314,7 +314,7 @@ class MASTER(nn.Module):
             self.gat_fusion = GatedFusion(d_model)
         self.unc_head = None
         if joint_unc:
-            from uncertainty import ScaleHead
+            from .uncertainty import ScaleHead
             self.unc_head = ScaleHead(d_model, unc_hidden, dist=joint_unc)
 
     def forward(self, x, adjs=None, return_repr=False, weights=None):
@@ -486,7 +486,7 @@ class MASTERModel(SequenceModel):
         mse = self.loss_fn(out['pred'], label)
         if self.joint_unc is None:
             return mse, mse
-        from uncertainty import nll_torch
+        from .uncertainty import nll_torch
         m = ~torch.isnan(label)
         nll = nll_torch(label[m], out['pred'][m], out['scale'][m], out.get('nu', None)[m] if 'nu' in out else None)
         # backprop the NLL jointly, keep the MSE of the mean for the common stop criterion

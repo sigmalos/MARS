@@ -18,9 +18,9 @@ import numpy as np
 import torch
 from torch import nn
 
-from master import MASTERModel
-import relations as rel
-from uncertainty import ScaleHead, nll_torch, prob_metrics
+from mars.master import MASTERModel
+from mars import relations as rel
+from mars.uncertainty import ScaleHead, nll_torch, prob_metrics
 
 p = argparse.ArgumentParser()
 p.add_argument('--universe', default='csi300')
