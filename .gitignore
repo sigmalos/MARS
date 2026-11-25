@@ -1,6 +1,9 @@
-analysis_out/
-checkpoints/
+# local tooling / documents / experiment outputs (not versioned)
+.claude/
+docs/
 logs/
-__pycache__/
 results/
 results_stage2/
+analysis_out/
+checkpoints/
+__pycache__/

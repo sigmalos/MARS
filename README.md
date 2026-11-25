@@ -1,119 +1,101 @@
-[![DOI](https://zenodo.org/badge/732363363.svg)](https://doi.org/10.5281/zenodo.15480922)
-# Readme 
-This is the official code and supplementary materials for our AAAI-2024 paper: **MASTER: Market-Guided Stock Transformer for Stock Price Forecasting**. [[Paper]](https://ojs.aaai.org/index.php/AAAI/article/view/27767)  [[ArXiv preprint]](https://arxiv.org/abs/2312.15235) 
+# MARS: Market-Aware Relational Stock Transformer
 
-MASTER is a stock transformer for stock price forecasting, which models the momentary and cross-time stock correlation and guides feature selection with market information.
+MARS 是在 [MASTER](https://github.com/SJTU-DMTai/MASTER)（AAAI 2024，*Market-Guided Stock Transformer for Stock Price Forecasting*）基础上做的**关系增强**改进。它保留 MASTER 的 Feature Gate、T-Attention、S-Attention 与 Temporal Attention 主干，并在 S-Attention 旁并联一个**多关系股票图注意力分支**：
 
-![MASTER framework](framework.png)
+- **按时点有效的行业关系图**：证监会行业，来自 baostock 月度快照；申万一/二/三级行业，来自巨潮资讯的行业变更记录；
+- **动态收益相关图**：每只股票连向预测日之前 $W$ 个交易日收益最相关的 Top-$k$ 只股票。可选市场残差相关的**带符号边**（对冲关系）；
+- 每种关系使用独立的 GAT，经**关系级注意力**融合后，与 S-Attention 的输出**门控相加**。新增模块均零初始化，因此训练初期与 MASTER 等价；
+- 可选的**解耦式（两阶段）Student-t 预测不确定性**：冻结均值网络，只训练尺度头，因此不改变排序。
 
-Our original experiments were conducted in a complex business codebase developed based on Qlib. The original code is confidential and exhaustive. In order to enable anyone to quickly use MASTER, here we publish our well-processed data and core code. 
+本仓库 fork 自 [SJTU-DMTai/MASTER](https://github.com/SJTU-DMTai/MASTER)，`model/`、`qlib-update/` 与 `MASTER-*.pdf` 均为原仓库内容。
 
----
+## 主要结果
 
-## :fire: Important Notice on 2025-06-26
-### About the Qlib Version
-The linked Qlib version is not under the authors' maintenance and there can be inconsistency to this repo, or to the paper. To reduce the difference, we have published some files under `qlib-update` to help those who encounter problems when using Qlib repo. Still, please refrain us from answering questions on how to use Qlib. 
+实验数据为 MASTER 官方开源数据（opensource 版本）：训练集 2008-01—2020-03，测试集 2020-07—2022-12。下表为 10 个随机种子的均值，$\Delta$ 为与同种子 MASTER 的配对差值，括号内为 [提升种子数/10]。
 
-### About Validation
-For validation, we need to feed all the samples to the model but only drop nan labels when computing metrics. We recently noticed that the linked Qlib version is different from our intention by directly using the `learn_processor` instead of `infer_processor` for the validation set. It also affects the published validation data (v. 2024-12-07) as we dumped it with the help of the linked Qlib version. Luckily, it **won't affect any checkpoint or results** if you use **the training loss threshold** to end the training, as we did.
+| 模型（官方停止准则：训练 MSE ≤ 0.95） | CSI300 IC | CSI300 RankIC | CSI800 IC | CSI800 RankIC |
+| --- | --- | --- | --- | --- |
+| MASTER（复现） | 0.0597 | 0.0668 | 0.0469 | 0.0596 |
+| MARS：行业 + 相关图 | 0.0671（+0.0074 [10/10]） | 0.0731 | 0.0481 | 0.0606 |
+| MARS：行业 + 相关 + 申万二级 | 0.0673（+0.0075 [9/10]） | 0.0727 | 0.0489（+0.0020 [9/10]） | 0.0605 |
+| 随机图对照（度分布相同） | 0.0595 | 0.0647 | 0.0445 | 0.0592 |
 
-Since there is no significant impact, we will not dump and republish the validation data again. If you are interested in remedying the flaw or observing the validation loss, pay attention to `qlib-update/pytorch_master_ts.py`, especially the `fit`, `test_epoch` and `predict` functions of class `MASTERModel`. Also, you can easily dump it by yourself with `dump_data`.
+- 官方停止准则会让参数更多的关系模型提前 5—7 轮停止。若按相同训练轮数比较，多关系模型在两个指数上 10/10 个种子同时提升 IC 与 RankIC：CSI300 为 +0.0070 / +0.0059，CSI800 为 +0.0048 / +0.0028，$p<0.001$。随机图对照没有提升，说明收益来自真实的股票关联。
+- **换手约束**：组合仍取 top-30，但每日最多替换 3 只（CSI300）或 5 只（CSI800）股票，即 Qlib TopkDropout 的 `n_drop`。这样可在所有配置上把含费 IR 提高 0.5—1.1。CSI300 上“行业+相关”模型的含费超额年化为 23.5%、IR 1.94，官方设定下的 MASTER 为 14.2%、IR 1.15。
+- **两阶段 Student-t 不确定性**：测试集 NLL 由常数方差的 1.426 降至 1.314，平均校准误差 0.011。
+- **未能在测试集上稳定提升的方向**：20 日相关窗口、带符号边、在内部验证集上选出的停止规则、训练时的换手惩罚。其中换手惩罚会破坏预测信号。
 
-For any questions, please first check on the closed issues! There should be some solutions as this repo have been here for more than 2.5 years. :smile:
+**推荐配置**：行业 + 相关图（60 日窗口，无符号边），官方停止准则；组合采用 top-30，`n_drop`=3（CSI300）/ 5（CSI800）。汇总后的结果文件见 `results_summary/`。
 
----
+## 目录
 
+| 路径 | 内容 |
+| --- | --- |
+| `master.py` | MARS 模型：多关系 GAT（边模式 none / weight / signed）、关系注意力、门控融合、动态相关图、可选联合尺度头 |
+| `base_model.py` | 训练与评估：按日向量化取数、官方停止准则与验证集选模、换手惩罚、固定轮数轨迹训练 |
+| `main.py` | 训练 / 评估入口，同时记录官方准则（stop）与验证集最优（best）两种协议 |
+| `run_traj.py` | 固定轮数训练并保存每轮预测，支持内部验证切分（`--protocol inner`） |
+| `relations.py` | 把预计算的关系数组与收益矩阵挂到 Qlib `TSDataSampler` 上 |
+| `uncertainty.py`、`stage2_uncertainty.py` | 尺度头、高斯 / Student-t 似然、概率指标；两阶段不确定性训练 |
+| `backtest.py` | Qlib 官方回测封装（TopkDropout），以及向量化 top-k 回测 |
+| `scripts/fetch_industry.py` | 下载按时点的证监会行业（baostock）与行业变更记录（巨潮资讯） |
+| `scripts/build_relations.py`、`scripts/build_returns.py` | 构建逐样本的关系数组，以及全局日收益矩阵 |
+| `scripts/` 其余文件 | 批量任务（`make_jobs*.py`、`job_queue.py`）、选择与统计（`select_inner.py`、`aggregate.py`、`final_*.py`）、回测与作图 |
+| `data/` | 市场信息表，以及处理后的按时点行业表 `csrc_pit.csv` / `sw_pit.csv` 和关系统计 |
 
-## Usage
-1. Install dependencies.
-- pandas == 1.5.3
-- torch == 1.11.0
+## 环境
 
-2. Install [Qlib](https://github.com/microsoft/qlib). We have minimized the reliance on Qlib, and you can simply install it by
-- <code>pip install pyqlib </code>
+Python 3.11、PyTorch 2.5、pandas 2.3、numpy 2.x、pyqlib 0.9.7、scipy、matplotlib。下载行业数据另需 `baostock` 与 `cryptography`。
 
-3. Download data and unpack it into <code> data/ </code>
+## 数据准备
 
-4. Run main.py. Depending on which data you want to train on, remember to change the lines in <code> base_model.py/SequenceModel/train_epoch </code>.
+1. **MASTER 数据**：从 MASTER 原 README 中的链接下载 opensource 版本数据，例如放到 `/data/dataset/MASTER/opensource/{csi300,csi800}_dl_{train,valid,test}.pkl`。
+2. **Qlib 行情**：下载 [chenditc/investment_data](https://github.com/chenditc/investment_data/releases) 发布的 `qlib_bin.tar.gz` 并解压，用于计算相关图、历史波动率和回测。
+3. **行业与关系数据**：
+   ```bash
+   python scripts/fetch_industry.py csrc --start 2007-12-01 --end 2022-12-31   # 证监会行业月度快照
+   python scripts/fetch_industry.py cninfo                                    # 申万等行业变更记录（可断点续传）
+   python scripts/build_relations.py --out /data/dataset/MASTER_relations --data_out data --qlib_dir <qlib_bin>
+   python scripts/build_returns.py   --out /data/dataset/MASTER_relations --qlib_dir <qlib_bin>
+   ```
 
-5. We provide models trained on the original data or opensource data: <code> model/csi300_original_0.pkl, model/csi800_original_0.pkl, model/csi300_opensource_0.pkl, model/csi800_opensource_0.pkl</code>
+各脚本的默认路径均为 `/data/dataset/...`，可以用 `--data_dir`、`--relation_dir`、`--qlib_dir` 等参数覆盖。
 
+## 训练与评估
 
-## Dataset
-### Choose a data source
-Our previous published valid & test data are problematic as we mistakenly used the training processors when dumping them out from our codebase. We recently found out this issue that previously published valid & test data per day contains 95% of all stocks, but in our original experiment, we used all stocks. The original datasource and codebase are the company's properties. It is sad that although we tried a lot to publish the dumped data for everyone, we ended up with mistake operations. Now our access has expired and we cannot dump the original correct valid & test data again. 
+```bash
+# MASTER 基准与 MARS（行业 + 相关图），一次训练同时记录官方准则与验证集选模两种协议
+python main.py --universe csi300 --seeds 0 --tag base
+python main.py --universe csi300 --seeds 0 --tag ind_corr --relations ind,corr
+python main.py --universe csi300 --seeds 0 --tag multi    --relations ind,corr,fine
 
-We try to remedy it with this [opensource data](github.com/chenditc/investment_data/releases), and process it again with the Qlib framework. You can now download them from one of the following links (the data files are the same) and seamlessly use them in this lightweight repo. 
+# 动态相关图（任意窗口 / 带符号边），固定 40 轮并保存每轮预测
+python run_traj.py --universe csi300 --seed 0 --protocol full --relations ind,dcorr \
+    --model_kwargs '{"corr_window": 60}' --tag ic_w60
 
-- [Update opensource data][OneDrive link](https://1drv.ms/f/c/652674690cc447e6/Eu8Kxv4xxTFMtDQqTW0IU0UB8rnpjACA5twMi8BA_PfbSA)
-- [Update opensource data][MEGA link](https://mega.nz/folder/MS8mUTbL#qeVz3KR1-MyXc_uLPtkvTg)
-- [Update opensource data][Baidu link](https://pan.baidu.com/s/1qmDIepmGY1DVBTGGiipxfA?pwd=pm49). 
+# 两阶段 Student-t 不确定性（基于已训练的多关系模型）
+python stage2_uncertainty.py --universe csi300 --seed 0 --stage1_tag multi --relations ind,corr,fine
 
-Our original codebase implemented a DropExtremeLabel processor that 1) drop 5% extreme labels during training and 2) predict for all stocks on inference. Since the Qlib framework does not own such a processor, we add a few lines in <code>base_model.py/SequenceModel/train_epoch </code> to clumsily perform DropExtremeLabel and CSZcoreNorm during training. You can find comments in the code and read more in the <code> Readme:Preprocessing </code>.
-
-Luckily, for training, you can still choose from the original data or opensource data. The original training data including market information are correctly dumped.Here we attach results with the renewed data and seed 0-4 in <code>model/performance.xlsx</code>. We did not tune on hyperparameters. Since the data source is changed, you may want to tune on beta and the stopping epoch. 
-
-
-### Form
-The downloaded data is split into training, validation, and test sets, with two stock universes. Note the csi300 data is a subset of the csi800 data. You can use the following code to investigate the **datetime, instrument, and feature formulation**.
-```python
-with (f'data/original/csi300_dl_train.pkl', 'rb') as f:
-    dl_train = pickle.load(f)
-    dl_train.data # a Pandas dataframe
-```
-In our codebase, the data are gathered chronically and then grouped by prediction dates. the <code> data </code> iterated by the data loader is of shape (N, T, F), where:
-- N - number of stocks. For CSI300, N is around 300 on each prediction date; For CSI800, N is around 800 on each prediction date.
-- T - length of lookback_window, T=8.
-- F - 222 in total, including 158 factors, 63 market information, and 1 label.        
-
-### Market information
-For convenient reference, we extract and organize market information from the published data into <code>data/csi_market_information.csv</code>. You can check the **datetime and feature formulation** in the file. Note that m is shared by all stocks. The market data is generated by the following pseudo-code. 
-
-```python
-m = []
-for S in csi300, csi500, csi800:
-  m += [market_index(S,-1)]
-  for d in [5, 10, 20, 30, 60]:
-    m += [historical_market_index_mean(S, d), historical_market_index_std(S, d)]
-    m += [historical_amount_mean(S, d), historical_amount_std(S, d)]
-```
-
-### Preprocessing
-The published data went through the following necessary preprocessing. 
-
-1. For features, we first perform [**RobustZScoreNorm**](https://github.com/microsoft/qlib/blob/main/qlib/data/dataset/processor.py), which computes median and MAD for each feature of all stocks in the training timespan for normalization. It then clips outliers as -3 and 3. When processing the test data, the median and MAD for each feature are **estimated by** (or borrowed from) the training data, so that we have no data leakage. We then use [**Fillna**](https://github.com/microsoft/qlib/blob/main/qlib/data/dataset/processor.py) to fill the NA features as default value 0. The processing on features are the same for the original data and the opensource data.
-   
-2. For labels, **during training**, we first DropNA labels and 5% of the most extreme labels, then we perform [**CSZscoreNorm**](https://github.com/microsoft/qlib/blob/main/qlib/data/dataset/processor.py). The downloaded **original training data** already performed  DropNA DropExtreme, and CSZscoreNorm on labels. The downloaded opensource training, validation, and test data, only performed DropNA labels. We clumsily perform DropExtreme and CSZscoreNorm for training. Please refer to the comments in <code>base_model.py/SequenceModel/train_epoch </code>.
-
-**CSZcoreNorm** is a common practice in Qlib to standardize the labels for stock price forecasting. Here 'CS' stands for Cross-Sectional, which means we group the labels on each date and compute mean/std across stocks for normalization. To mitigate the difference between a normal distribution and groundtruth distribution, we use **DropExtremeLabel** to filter out 5\% of most extreme labels in training. 
-
-Note that for the reported metrics (IC, RankIC, etc.), **whether to normalize the groundtruth label won't change the value**, and nan in the groundtruth will be ignored.
-
-
-## A Qlib implementation
-We are happy to hear that there is a Qlib-implementation of MASTER at this [repo](https://github.com/SJTU-Quant/qlib/tree/main/examples/benchmarks/MASTER). We thank [LIU, Qiaoan](https://github.com/zhiyuan5986) and [ZHAO, Lifan](https://github.com/MogicianXD) for their contributions and please also give credits to the new repo if you use it. With the Qlib framework, you can **report AR, IR**, and more portfolio-based metrics. We intend not to rebuild the entire backtest framework again in this repo.
-
-In the meantime, please note that
-- **Default Datasource**: The new version utilizes a default data source published by Qlib, which covers a different timespan. It also uses **stock universe CSI300 & CSI500**, because qlib does **not** include a CSI800 dataset. Correspondingly, **the representative indices to construct market information are different**, it uses CSI100, CSI300, and CSI500, which is different from CSI300, CSI500, and CSI800 as in this repo. 
-
-- **More Complete Datasource**: You can substitute the Qlib data with this [opensource data](https://github.com/chenditc/investment_data/releases) to align with our experimented timespan and experiment on CSI800. All other data sources are considered **logically equal** to our published data but may differ in values (usually one is imcomplete) because we use different automatic tools (such as crawler) to collect these data. Correpondingly, you may want to instantiate market information the same as in the original paper. You can modify the return value of <code>qlib/contrib/data/dataset.py</code>, <code> marketDataHandler:get_feature_config</code> with 
-```python
-['Mask($close/Ref($close,1)-1, "sh000300")', 'Mask(Mean($close/Ref($close,1)-1,5), "sh000300")', 'Mask(Std($close/Ref($close,1)-1,5), "sh000300")', 'Mask(Mean($amount,5)/$amount, "sh000300")', 'Mask(Std($amount,5)/$amount, "sh000300")', 'Mask(Mean($close/Ref($close,1)-1,10), "sh000300")', 'Mask(Std($close/Ref($close,1)-1,10), "sh000300")', 'Mask(Mean($amount,10)/$amount, "sh000300")', 'Mask(Std($amount,10)/$amount, "sh000300")', 'Mask(Mean($close/Ref($close,1)-1,20), "sh000300")', 'Mask(Std($close/Ref($close,1)-1,20), "sh000300")', 'Mask(Mean($amount,20)/$amount, "sh000300")', 'Mask(Std($amount,20)/$amount, "sh000300")', 'Mask(Mean($close/Ref($close,1)-1,30), "sh000300")', 'Mask(Std($close/Ref($close,1)-1,30), "sh000300")', 'Mask(Mean($amount,30)/$amount, "sh000300")', 'Mask(Std($amount,30)/$amount, "sh000300")', 'Mask(Mean($close/Ref($close,1)-1,60), "sh000300")', 'Mask(Std($close/Ref($close,1)-1,60), "sh000300")', 'Mask(Mean($amount,60)/$amount, "sh000300")', 'Mask(Std($amount,60)/$amount, "sh000300")',
-'Mask($close/Ref($close,1)-1, "sh000905")', 'Mask(Mean($close/Ref($close,1)-1,5), "sh000905")', 'Mask(Std($close/Ref($close,1)-1,5), "sh000905")', 'Mask(Mean($amount,5)/$amount, "sh000905")', 'Mask(Std($amount,5)/$amount, "sh000905")', 'Mask(Mean($close/Ref($close,1)-1,10), "sh000905")', 'Mask(Std($close/Ref($close,1)-1,10), "sh000905")', 'Mask(Mean($amount,10)/$amount, "sh000905")', 'Mask(Std($amount,10)/$amount, "sh000905")', 'Mask(Mean($close/Ref($close,1)-1,20), "sh000905")', 'Mask(Std($close/Ref($close,1)-1,20), "sh000905")', 'Mask(Mean($amount,20)/$amount, "sh000905")', 'Mask(Std($amount,20)/$amount, "sh000905")', 'Mask(Mean($close/Ref($close,1)-1,30), "sh000905")', 'Mask(Std($close/Ref($close,1)-1,30), "sh000905")', 'Mask(Mean($amount,30)/$amount, "sh000905")', 'Mask(Std($amount,30)/$amount, "sh000905")', 'Mask(Mean($close/Ref($close,1)-1,60), "sh000905")', 'Mask(Std($close/Ref($close,1)-1,60), "sh000905")', 'Mask(Mean($amount,60)/$amount, "sh000905")', 'Mask(Std($amount,60)/$amount, "sh000905")',
-'Mask($close/Ref($close,1)-1, "sh000906")', 'Mask(Mean($close/Ref($close,1)-1,5), "sh000906")', 'Mask(Std($close/Ref($close,1)-1,5), "sh000906")', 'Mask(Mean($amount,5)/$amount, "sh000906")', 'Mask(Std($amount,5)/$amount, "sh000906")', 'Mask(Mean($close/Ref($close,1)-1,10), "sh000906")', 'Mask(Std($close/Ref($close,1)-1,10), "sh000906")', 'Mask(Mean($amount,10)/$amount, "sh000906")', 'Mask(Std($amount,10)/$amount, "sh000906")', 'Mask(Mean($close/Ref($close,1)-1,20), "sh000906")', 'Mask(Std($close/Ref($close,1)-1,20), "sh000906")', 'Mask(Mean($amount,20)/$amount, "sh000906")', 'Mask(Std($amount,20)/$amount, "sh000906")', 'Mask(Mean($close/Ref($close,1)-1,30), "sh000906")', 'Mask(Std($close/Ref($close,1)-1,30), "sh000906")', 'Mask(Mean($amount,30)/$amount, "sh000906")', 'Mask(Std($amount,30)/$amount, "sh000906")', 'Mask(Mean($close/Ref($close,1)-1,60), "sh000906")', 'Mask(Std($close/Ref($close,1)-1,60), "sh000906")', 'Mask(Mean($amount,60)/$amount, "sh000906")', 'Mask(Std($amount,60)/$amount, "sh000906")'],
-['Mask($close/Ref($close,1)-1, "sh000300")', 'Mask(Mean($close/Ref($close,1)-1,5), "sh000300")', 'Mask(Std($close/Ref($close,1)-1,5), "sh000300")', 'Mask(Mean($amount,5)/$amount, "sh000300")', 'Mask(Std($amount,5)/$amount, "sh000300")', 'Mask(Mean($close/Ref($close,1)-1,10), "sh000300")', 'Mask(Std($close/Ref($close,1)-1,10), "sh000300")', 'Mask(Mean($amount,10)/$amount, "sh000300")', 'Mask(Std($amount,10)/$amount, "sh000300")', 'Mask(Mean($close/Ref($close,1)-1,20), "sh000300")', 'Mask(Std($close/Ref($close,1)-1,20), "sh000300")', 'Mask(Mean($amount,20)/$amount, "sh000300")', 'Mask(Std($amount,20)/$amount, "sh000300")', 'Mask(Mean($close/Ref($close,1)-1,30), "sh000300")', 'Mask(Std($close/Ref($close,1)-1,30), "sh000300")', 'Mask(Mean$($amount,30)/$amount, "sh000300")', 'Mask(Std($amount,30)/$amount, "sh000300")', 'Mask(Mean($close/Ref($close,1)-1,60), "sh000300")', 'Mask(Std($close/Ref($close,1)-1,60), "sh000300")', 'Mask(Mean($amount,60)/$amount, "sh000300")', 'Mask(Std($amount,60)/$amount, "sh000300")',
-'Mask($close/Ref($close,1)-1, "sh000905")', 'Mask(Mean($close/Ref($close,1)-1,5), "sh000905")', 'Mask(Std($close/Ref($close,1)-1,5), "sh000905")', 'Mask(Mean($amount,5)/$amount, "sh000905")', 'Mask(Std($amount,5)/$amount, "sh000905")', 'Mask(Mean($close/Ref($close,1)-1,10), "sh000905")', 'Mask(Std($close/Ref($close,1)-1,10), "sh000905")', 'Mask(Mean($amount,10)/$amount, "sh000905")', 'Mask(Std($amount,10)/$amount, "sh000905")', 'Mask(Mean($close/Ref($close,1)-1,20), "sh000905")', 'Mask(Std($close/Ref($close,1)-1,20), "sh000905")', 'Mask(Mean($amount,20)/$amount, "sh000905")', 'Mask(Std($amount,20)/$amount, "sh000905")', 'Mask(Mean($close/Ref($close,1)-1,30), "sh000905")', 'Mask(Std($close/Ref($close,1)-1,30), "sh000905")', 'Mask(Mean($amount,30)/$amount, "sh000905")', 'Mask(Std($amount,30)/$amount, "sh000905")', 'Mask(Mean($close/Ref($close,1)-1,60), "sh000905")', 'Mask(Std($close/Ref($close,1)-1,60), "sh000905")', 'Mask(Mean($amount,60)/$amount, "sh000905")', 'Mask(Std($amount,60)/$amount, "sh000905")',
-'Mask($close/Ref($close,1)-1, "sh000906")', 'Mask(Mean($close/Ref($close,1)-1,5), "sh000906")', 'Mask(Std($close/Ref($close,1)-1,5), "sh000906")', 'Mask(Mean($amount,5)/$amount, "sh000906")', 'Mask(Std($amount,5)/$amount, "sh000906")', 'Mask(Mean($close/Ref($close,1)-1,10), "sh000906")', 'Mask(Std($close/Ref($close,1)-1,10), "sh000906")', 'Mask(Mean($amount,10)/$amount, "sh000906")', 'Mask(Std($amount,10)/$amount, "sh000906")', 'Mask(Mean($close/Ref($close,1)-1,20), "sh000906")', 'Mask(Std($close/Ref($close,1)-1,20), "sh000906")', 'Mask(Mean($amount,20)/$amount, "sh000906")', 'Mask(Std($amount,20)/$amount, "sh000906")', 'Mask(Mean($close/Ref($close,1)-1,30), "sh000906")', 'Mask(Std($close/Ref($close,1)-1,30), "sh000906")', 'Mask(Mean($amount,30)/$amount, "sh000906")', 'Mask(Std($amount,30)/$amount, "sh000906")', 'Mask(Mean($close/Ref($close,1)-1,60), "sh000906")', 'Mask(Std($close/Ref($close,1)-1,60), "sh000906")', 'Mask(Mean($amount,60)/$amount, "sh000906")', 'Mask(Std($amount,60)/$amount, "sh000906")']
+# Qlib 回测：run_backtests.py 为官方设定（top-30，n_drop=30）；
+# 换手约束回测用 backtest.qlib_backtest(score, universe, start, end, n_drop=3)，见 scripts/final_s.py
+python scripts/run_backtests.py --results results --out analysis_out/backtest.json
 ```
 
+可用的关系类型（`--relations`）：
 
-- **DropExtremeLabel**: The new version does **not** include the 'DropExtremeLabel' operation in data preprocessing. You may want to implement them in code because it will improve performance, as we clumsily did in <code>MASTER:base_model.py/SequenceModel/train_epoch</code>. 
+| 关系 | 含义 |
+| --- | --- |
+| `ind` | 证监会行业，按时点有效 |
+| `corr` | 60 日 Top-10 相关图（预计算） |
+| `dcorr` | 动态相关图，窗口与符号由 `--model_kwargs` 的 `corr_window`、`corr_mode`、`corr_edge` 指定（仅 `run_traj.py`） |
+| `fine` / `sw1` / `sw3` | 申万二 / 一 / 三级行业 |
+| `snap` | 用当前行业快照回填历史（对照） |
+| `rand` | 随机图（对照） |
 
-- **"Qlib is soooo complicated!"**: The usage of Qlib can be daunting if you are completely new to it. That is why we open this repo to eliminate the reliance on Qlib. The contributors to MASTER-Qlib implementation are volunteers that did not participate in the original research of MASTER, please stick to this repo if there are inconsistency. Moreover, please refrain us from answering questions on how to use Qlib. 
+## 致谢与引用
 
+MARS 基于 MASTER 的代码与数据。使用本仓库时，请引用 MASTER：
 
-## Cite
-If you use the data or the code, please cite our work! :smile:
 ```latex
 @inproceedings{li2024master,
   title={Master: Market-guided stock transformer for stock price forecasting},
@@ -126,4 +108,4 @@ If you use the data or the code, please cite our work! :smile:
 }
 ```
 
-
+许可证沿用原仓库的 MIT License（见 `LICENSE`）。
